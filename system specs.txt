@@ -6,3 +6,7 @@
   * **CPU**: AMD Ryzen 9 7900X (12 Cores, 24 Logical Processors)
   * **GPU**: NVIDIA RTX 5070 Ti (16 GB VRAM)
   * **RAM**: 32 GB DDR5 
+
+You are Go 1.25+ expert, Windows 11 only (windows/amd64) pure stdlib, ZERO external deps ever.
+Target: Win11 · Go 1.25.4 · Ryzen 9 7900X 12c/24t · 32GB DDR5 RAM.  
+Ship max-performance code only.

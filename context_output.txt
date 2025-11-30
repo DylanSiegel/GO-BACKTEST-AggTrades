@@ -1,11 +1,44 @@
 --- File Tree Structure ---
-|-- buildalpha.go
+|-- data/
+|-- build.go
+|-- common.go
 |-- data.go
+|-- main.go
 |-- sanity.go
-|-- shared.go
-|-- studyalpha.go
+|-- scorecard.go
+|-- study.go
+|-- sum.go
+    |-- BTCUSDT/
+    |-- features/
+    |-- reports/
+        |-- 2020/
+        |-- 2021/
+        |-- 2022/
+        |-- 2023/
+        |-- 2024/
+        |-- 2025/
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..11]/ (11 month dirs)
+        |-- BTCUSDT/
+            |-- 2020/
+            |-- 2021/
+            |-- 2022/
+            |-- 2023/
+            |-- 2024/
+            |-- 2025/
+                |-- [01..12]/ (12 month dirs)
+                |-- [01..12]/ (12 month dirs)
+                |-- [01..12]/ (12 month dirs)
+                |-- [01..12]/ (12 month dirs)
+                |-- [01..12]/ (12 month dirs)
+                |-- [01..11]/ (11 month dirs)
+        |-- alpha_core_BTCUSDT.json
 
-// --- File: buildalpha.go ---
+// --- File: build.go ---
 
 ```go
 package main
@@ -19,21 +52,17 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"sync"
 )
 
-// Config
+// --- Configuration ---
 const (
-	Year     = 2024
-	Month    = 1
-	StartDay = 1
-	EndDay   = 31
-	Warmup   = 5000
-	BaseDir  = "data"
-	Symbol   = "BTCUSDT"
+	Warmup = 5000
 )
 
-// Precomputed Kernels
+// --- Precomputed Kernels ---
 var (
 	PropResKernel [2048]float64
 	CountPowLook  [256]float64
@@ -41,63 +70,171 @@ var (
 )
 
 func init() {
+	// Pre-compute expensive powers
 	for k := 0; k < 2048; k++ {
 		PropResKernel[k] = 1.0 / math.Pow(float64(k+12), 0.41)
 	}
 	for c := 0; c < 256; c++ {
+		// Clamped power curve for trade counts
 		CountPowLook[c] = math.Min(math.Pow(float64(c), 0.63), 8.8)
 	}
 }
 
-func main() {
-	fmt.Printf("--- BUILDALPHA GO 2025 | %s %d-%02d ---\n", Symbol, Year, Month)
+// --- Entry Point ---
+func runBuild() {
+	fmt.Printf("--- BUILDALPHA GO (Adaptive Z-Score) | FULL HISTORY SCAN: %s ---\n", Symbol)
 
-	for d := StartDay; d <= EndDay; d++ {
-		res := processDay(d)
-		fmt.Println(res)
+	// 1. Discovery Phase
+	root := filepath.Join(BaseDir, Symbol)
+	var tasks []TaskID
+
+	years, _ := os.ReadDir(root)
+	for _, yDir := range years {
+		if !yDir.IsDir() {
+			continue
+		}
+		y, err := strconv.Atoi(yDir.Name())
+		if err != nil {
+			continue
+		}
+
+		months, _ := os.ReadDir(filepath.Join(root, yDir.Name()))
+		for _, mDir := range months {
+			if !mDir.IsDir() {
+				continue
+			}
+			m, err := strconv.Atoi(mDir.Name())
+			if err != nil {
+				continue
+			}
+
+			// Check for index file existence to confirm valid data
+			idxPath := filepath.Join(root, yDir.Name(), mDir.Name(), "index.quantdev")
+			if _, err := os.Stat(idxPath); err == nil {
+				// Add days 1-31 (existence checked later)
+				for d := 1; d <= 31; d++ {
+					tasks = append(tasks, TaskID{y, m, d})
+				}
+			}
+		}
 	}
+
+	// Sort tasks for chronological execution
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].Y != tasks[j].Y {
+			return tasks[i].Y < tasks[j].Y
+		}
+		if tasks[i].M != tasks[j].M {
+			return tasks[i].M < tasks[j].M
+		}
+		return tasks[i].D < tasks[j].D
+	})
+
+	fmt.Printf("[build] Found potential data for %d months. Starting build...\n", len(tasks)/31)
+
+	// 2. Execution Phase
+	// Note: We process days sequentially because processBuildDay internally
+	// parallelizes across all CPUThreads using the 'chunks' logic.
+	// Running days in parallel + chunks in parallel would cause thrashing.
+	validDays := 0
+	for _, t := range tasks {
+		res, built := processBuildDay(t.Y, t.M, t.D)
+		if built {
+			fmt.Println(res)
+			validDays++
+		}
+	}
+	fmt.Printf("--- Build Complete. Built %d days of Alpha. ---\n", validDays)
 }
 
-func processDay(day int) string {
-	idxPath := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", Year), fmt.Sprintf("%02d", Month), "index.quantdev")
-	dataPath := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", Year), fmt.Sprintf("%02d", Month), "data.quantdev")
+type TaskID struct {
+	Y, M, D int
+}
+
+// --- Online Normalization (Welford's Algorithm) ---
+type OnlineZ struct {
+	count float64
+	mean  float64
+	m2    float64
+}
+
+// Updates stats and returns the Z-Score of x
+func (z *OnlineZ) Update(x float64) float64 {
+	z.count++
+	delta := x - z.mean
+	z.mean += delta / z.count
+	delta2 := x - z.mean
+	z.m2 += delta * delta2
+
+	if z.count < 200 {
+		return 0.0 // Warmup period for the Z-score itself
+	}
+
+	// Variance = m2 / (count - 1)
+	variance := z.m2 / (z.count - 1)
+	if variance < 1e-12 {
+		return 0.0
+	}
+
+	std := math.Sqrt(variance)
+	val := (x - z.mean) / std
+
+	// Clamp to +/- 4.0 to prevent blown-up outliers from ruining the linear combo
+	if val > 4.0 {
+		return 4.0
+	}
+	if val < -4.0 {
+		return -4.0
+	}
+	return val
+}
+
+// --- Pipeline ---
+
+// Returns: Status String, Built Boolean
+func processBuildDay(year, month, day int) (string, bool) {
+	dir := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", year), fmt.Sprintf("%02d", month))
+	idxPath := filepath.Join(dir, "index.quantdev")
+	dataPath := filepath.Join(dir, "data.quantdev")
 
 	offset, length := findBlob(idxPath, day)
 	if length == 0 {
-		return fmt.Sprintf("MISSING %d", day)
+		// Silent return for non-existent days (e.g. Feb 30)
+		return "", false
 	}
 
-	// Read Blob
+	// 1. IO Read
 	f, err := os.Open(dataPath)
 	if err != nil {
-		return fmt.Sprintf("ERR_IO %d", day)
+		return fmt.Sprintf("ERR_IO %04d-%02d-%02d", year, month, day), false
 	}
 	defer f.Close()
 	f.Seek(int64(offset), 0)
 	compData := make([]byte, length)
 	f.Read(compData)
 
-	// Decompress
+	// 2. Decompress
 	r, err := zlib.NewReader(bytes.NewReader(compData))
 	if err != nil {
-		return fmt.Sprintf("ERR_ZLIB %d", day)
+		return fmt.Sprintf("ERR_ZLIB %04d-%02d-%02d", year, month, day), false
 	}
 	blob, err := io.ReadAll(r)
 	r.Close()
 
 	if len(blob) < HeaderSize {
-		return "ERR_HDR"
+		return "ERR_HDR", false
 	}
 
-	// Validate Header
+	// 3. Header Parse
 	rowCount := binary.LittleEndian.Uint64(blob[8:])
 	body := blob[HeaderSize:]
 
 	if uint64(len(body)) != rowCount*RowSize {
-		return "ERR_SIZE"
+		return "ERR_SIZE", false
 	}
 
-	// Chunking
+	// 4. Parallel Processing
+	// Splitting the row processing across cores for this specific day
 	chunks := buildChunks(int(rowCount), CPUThreads)
 	results := make([][]byte, CPUThreads)
 	var wg sync.WaitGroup
@@ -111,25 +248,23 @@ func processDay(day int) string {
 	}
 	wg.Wait()
 
-	// Merge
+	// 5. Merge & Write
 	var outBuf bytes.Buffer
 	for _, res := range results {
 		outBuf.Write(res)
 	}
 
-	// Write
-	outDir := filepath.Join(BaseDir, "features", Symbol, fmt.Sprintf("%04d", Year), fmt.Sprintf("%02d", Month))
+	outDir := filepath.Join(BaseDir, "features", Symbol, fmt.Sprintf("%04d", year), fmt.Sprintf("%02d", month))
 	os.MkdirAll(outDir, 0755)
 	outPath := filepath.Join(outDir, fmt.Sprintf("%02d.bin", day))
 	os.WriteFile(outPath, outBuf.Bytes(), 0644)
 
-	return fmt.Sprintf("DONE %02d | %d rows", day, rowCount)
+	return fmt.Sprintf("DONE %04d-%02d-%02d | %d rows", year, month, day, rowCount), true
 }
 
 func buildChunks(total, n int) [][2]int {
 	res := make([][2]int, n)
-	base := total / n
-	rem := total % n
+	base, rem := total/n, total%n
 	start := 0
 	for i := 0; i < n; i++ {
 		len := base
@@ -149,85 +284,69 @@ func findBlob(idxPath string, targetDay int) (uint64, uint64) {
 	}
 	defer f.Close()
 
-	// Read Header
 	hdr := make([]byte, 16)
 	f.Read(hdr)
 	count := binary.LittleEndian.Uint64(hdr[8:])
-
-	row := make([]byte, 26) // v1 index row size
+	row := make([]byte, 26)
 	for i := uint64(0); i < count; i++ {
 		f.Read(row)
-		d := binary.LittleEndian.Uint16(row[0:])
-		if int(d) == targetDay {
-			off := binary.LittleEndian.Uint64(row[2:])
-			len := binary.LittleEndian.Uint64(row[10:])
-			return off, len
+		if int(binary.LittleEndian.Uint16(row[0:])) == targetDay {
+			return binary.LittleEndian.Uint64(row[2:]), binary.LittleEndian.Uint64(row[10:])
 		}
 	}
 	return 0, 0
 }
 
-// --- The Core Kernel (Optimized) ---
+// --- The Core Alpha Math (Optimized) ---
 
 func processKernel(data []byte, startRow, endRow, warmup int) []byte {
 	if startRow >= endRow {
 		return nil
 	}
-
 	actualStart := startRow - warmup
 	if actualStart < 0 {
 		actualStart = 0
 	}
 
-	// Pre-allocate output
-	validCount := endRow - startRow
-	out := make([]byte, validCount*FeatureSize)
+	// Output buffer: Ts(8) + Px(8) + Sig(8) = 24 bytes/row
+	out := make([]byte, (endRow-startRow)*FeatureSize)
 	outPos := 0
 
-	// State
-	stateGod := 0.0
-	stateFrag := 0.0
-	stateCntEma := 0.0
-	stateLamEma := 0.0
-	lamProp := 0.00005
-	cumDx := 0.0
-	cumFlow := 0.0
-	tradeCtr := 0
-	volClock := 0.0
+	// -- State Variables --
+	stateGod, stateFrag := 0.0, 0.0
+	stateCntEma, stateLamEma := 0.0, 0.0
+	lamProp, cumDx, cumFlow := 0.00005, 0.0, 0.0
+	tradeCtr, volClock := 0, 0.0
 
-	bufS := make([]float64, 2048)
-	bufQ := make([]float64, 2048)
+	// -- Normalizers (The Fix) --
+	zGod := &OnlineZ{}
+	zFrag := &OnlineZ{}
+	zProp := &OnlineZ{}
+	zSurge := &OnlineZ{}
+	zLam := &OnlineZ{}
+
+	// Ring buffers for Propagator
+	bufS, bufQ := make([]float64, 2048), make([]float64, 2048)
 	head := 0
 
-	prevTs := int64(0)
-	prevPx := 0.0
+	prevTs, prevPx := int64(0), 0.0
+	invPx, invQt := 1.0/PxScale, 1.0/QtScale
 
-	// Pre-calc scales
-	invPxScale := 1.0 / PxScale
-	invQtScale := 1.0 / QtScale
-
-	// Loop
 	offset := actualStart * RowSize
 	limit := endRow * RowSize
-
 	idx := actualStart
 
 	for offset < limit {
-		// Zero-copy read
-		// tid := binary.LittleEndian.Uint64(data[offset:])
+		// 1. Zero-Copy Parse
 		pxRaw := binary.LittleEndian.Uint64(data[offset+8:])
 		qtyRaw := binary.LittleEndian.Uint64(data[offset+16:])
-		// fid := ...
 		cnt := binary.LittleEndian.Uint32(data[offset+32:])
 		flags := binary.LittleEndian.Uint16(data[offset+36:])
 		ts := int64(binary.LittleEndian.Uint64(data[offset+38:]))
-
 		offset += RowSize
 
-		// Math
-		px := float64(pxRaw) * invPxScale
-		qty := float64(qtyRaw) * invQtScale
-
+		px := float64(pxRaw) * invPx
+		qty := float64(qtyRaw) * invQt
 		cIdx := int(cnt)
 		if cIdx < 1 {
 			cIdx = 1
@@ -244,64 +363,56 @@ func processKernel(data []byte, startRow, endRow, warmup int) []byte {
 		if prevTs > 0 && ts > prevTs {
 			dt = float64(ts - prevTs)
 		}
-
 		ret := 0.0
 		if prevPx > 0 {
 			ret = math.Log(px / prevPx)
 		}
-		prevTs = ts
-		prevPx = px
+		prevTs, prevPx = ts, px
 
-		// Vol Clock
+		// --- Signal 1: God (Momentum) ---
 		volClock += qty
 		if volClock > 1.0 {
 			stateGod *= 0.5
 			stateFrag *= 0.5
 			volClock = 0.0
 		}
+		gfIn := sign * qty * CountPowLook[cIdx]
+		stateGod = (stateGod * math.Exp(-0.0008*dt)) + gfIn
 
-		// Godflow
-		cPow := CountPowLook[cIdx]
-		gfIn := sign * qty * cPow
-		gfDecay := math.Exp(-0.0008 * dt)
-		stateGod = (stateGod * gfDecay) + gfIn
-
-		// Frag
+		// --- Signal 2: Frag (Mean Reversion) ---
 		gate := 1.0 / (1.0 + 12000.0*math.Abs(ret))
 		fsIn := math.Pow(float64(cIdx), 1.1) * qty * gate
 		stateFrag = (stateFrag * FragDecay) + fsIn
 
-		// PropRes
+		// --- Signal 3: Propagator (Decay) ---
 		head = (head + 1) & 2047
-		bufS[head] = sign
-		bufQ[head] = qty
-
+		bufS[head], bufQ[head] = sign, qty
 		kProp := 0.0
+		// Unrolled or vectorized by Go compiler?
+		// We trust the loop, but limit check is fixed 2000
 		for k := 0; k < 2000; k++ {
 			bIdx := (head - k) & 2047
 			kProp += bufS[bIdx] * bufQ[bIdx] * PropResKernel[k]
 		}
 
+		// Adjust Propagator sign based on recent history (Lambda Prop)
 		cumDx += math.Abs(px * ret)
 		cumFlow += math.Abs(sign * qty)
 		tradeCtr++
-
 		if tradeCtr >= 4000 {
 			if cumFlow > 1e-9 {
 				lamProp = 0.9*lamProp + 0.1*(cumDx/cumFlow)
 			}
-			cumDx = 0
-			cumFlow = 0
-			tradeCtr = 0
+			cumDx, cumFlow, tradeCtr = 0, 0, 0
 		}
 		kProp = -lamProp * kProp
 
-		// CountSurge
+		// --- Signal 4: Surge (Breakout) ---
 		surge := math.Max(float64(cIdx)-stateCntEma, 0.0)
 		kSurge := sign * math.Pow(qty, 0.77) * math.Pow(surge, 1.45)
 		stateCntEma = (float64(cIdx) * 0.002496) + (stateCntEma * 0.997504)
 
-		// Lambda
+		// --- Signal 5: Lambda (Liquidity Shock) ---
 		denom := math.Pow(qty, 0.84)
 		if denom < 1e-9 {
 			denom = 1.0
@@ -310,10 +421,21 @@ func processKernel(data []byte, startRow, endRow, warmup int) []byte {
 		kLam := sign * qty * (imp - stateLamEma)
 		stateLamEma = (imp * 0.001665) + (stateLamEma * 0.998335)
 
-		// Output
-		if idx >= startRow {
-			finalSig := 0.31*stateGod + 0.26*(-stateFrag) + 0.20*kProp + 0.13*kSurge + 0.10*kLam
+		// --- NORMALIZATION & COMBINATION ---
+		// We normalize here so the weights below are stable regardless of Year/Qty
+		nGod := zGod.Update(stateGod)
+		nFrag := zFrag.Update(stateFrag)
+		nProp := zProp.Update(kProp)
+		nSurge := zSurge.Update(kSurge)
+		nLam := zLam.Update(kLam)
 
+		if idx >= startRow {
+			// Linear Combination of Normalized Signals (Z-Scores)
+			// God, Prop, Surge, Lam are Momentum/Continuation -> Positive Weights
+			// Frag is Mean Reversion -> Negative Weight
+			finalSig := 0.35*nGod + 0.25*nProp + 0.15*nSurge + 0.10*nLam - 0.30*nFrag
+
+			// Write Binary Output
 			binary.LittleEndian.PutUint64(out[outPos:], uint64(ts))
 			binary.LittleEndian.PutUint64(out[outPos+8:], math.Float64bits(px))
 			binary.LittleEndian.PutUint64(out[outPos+16:], math.Float64bits(finalSig))
@@ -321,12 +443,132 @@ func processKernel(data []byte, startRow, endRow, warmup int) []byte {
 		}
 		idx++
 	}
-
 	return out
 }
 ```
 
-// --- End File: buildalpha.go ---
+// --- End File: build.go ---
+
+// --- File: common.go ---
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"math"
+)
+
+// --- Shared Configuration ---
+const (
+	// Hardware Optimization: Ryzen 9 7900X (12 Cores / 24 Threads)
+	// We saturate all logical cores for parallel workloads.
+	CPUThreads = 24
+
+	Symbol  = "BTCUSDT"
+	BaseDir = "data"
+
+	// Default Targets
+	TargetYear  = 2024
+	TargetMonth = 1
+
+	// Binary Format Constants
+	// Floating point scalar for integer compression (1.00 = 100000000)
+	PxScale = 100_000_000.0
+	QtScale = 100_000_000.0
+
+	// Magic headers for file identification
+	AggMagic   = "AGG3"
+	IdxMagic   = "QIDX"
+	IdxVersion = 1
+
+	// Binary Layout Sizes (Bytes)
+	HeaderSize  = 48
+	RowSize     = 48
+	FeatureSize = 24
+)
+
+// --- Binary Structures ---
+
+// AggHeader matches the binary layout for our compressed data files.
+// Used by data.go for writing and build.go for reading.
+type AggHeader struct {
+	Magic    [4]byte
+	Version  uint8
+	Day      uint8
+	ZLevel   uint16
+	RowCount uint64
+	MinTs    int64
+	MaxTs    int64
+	Padding  [16]byte
+}
+
+// --- Math Helpers ---
+// Highly optimized, inlined-capable math functions used across the monolith.
+
+// Mean calculates the arithmetic average of a slice.
+func Mean(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0.0
+	}
+	sum := 0.0
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
+}
+
+// StdDev calculates sample standard deviation.
+// Requires pre-calculated mean to avoid redundant iteration in tight loops.
+func StdDev(vals []float64, mean float64) float64 {
+	if len(vals) < 2 {
+		return 0.0
+	}
+	sumSq := 0.0
+	for _, v := range vals {
+		d := v - mean
+		sumSq += d * d
+	}
+	return math.Sqrt(sumSq / float64(len(vals)-1))
+}
+
+// Correlation calculates Pearson correlation coefficient (r).
+func Correlation(x, y []float64) float64 {
+	n := len(x)
+	if n != len(y) || n == 0 {
+		return 0.0
+	}
+	mx, my := Mean(x), Mean(y)
+	sxx, syy, sxy := 0.0, 0.0, 0.0
+	for i := 0; i < n; i++ {
+		dx := x[i] - mx
+		dy := y[i] - my
+		sxx += dx * dx
+		syy += dy * dy
+		sxy += dx * dy
+	}
+	if sxx == 0 || syy == 0 {
+		return 0.0
+	}
+	return sxy / math.Sqrt(sxx*syy)
+}
+
+// --- Binary Helpers ---
+
+// PutRow efficiently packs standard AggTrade data into a byte slice.
+// Uses LittleEndian to match x86_64 architecture (Ryzen 7900X) natively.
+func PutRow(buf []byte, tid, px, qty, fid uint64, cnt uint32, flags uint16, ts int64) {
+	binary.LittleEndian.PutUint64(buf[0:], tid)
+	binary.LittleEndian.PutUint64(buf[8:], px)
+	binary.LittleEndian.PutUint64(buf[16:], qty)
+	binary.LittleEndian.PutUint64(buf[24:], fid)
+	binary.LittleEndian.PutUint32(buf[32:], cnt)
+	binary.LittleEndian.PutUint16(buf[36:], flags)
+	binary.LittleEndian.PutUint64(buf[38:], uint64(ts))
+}
+```
+
+// --- End File: common.go ---
 
 // --- File: data.go ---
 
@@ -340,7 +582,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"math"
@@ -348,43 +589,49 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
-// Config
+// --- Local Constants (Specific to Data Downloader) ---
 const (
-	Symbol     = "BTCUSDT"
-	BaseDir    = "data"
-	FallbackDt = "2020-01-01"
+	// Data Source
 	HostData   = "data.binance.vision"
 	S3Prefix   = "data/futures/um"
 	DataSet    = "aggTrades"
-	RowsChunk  = 50_000
+	FallbackDt = "2020-01-01"
 )
 
+// --- Globals ---
 var (
 	httpClient *http.Client
 	stopEvent  bool
 	stopMu     sync.Mutex
+
+	// Directory Locks to fix race conditions on monthly files
+	dirLocks sync.Map
 )
 
 func init() {
+	// High-throughput Transport
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:    100,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
 	}
 	httpClient = &http.Client{
 		Transport: tr,
-		Timeout:   10 * time.Second,
+		Timeout:   20 * time.Second,
 	}
 }
 
-func main() {
-	// Signal handling
+// runData is called by shared.go -> main()
+func runData() {
+	// Graceful Shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -392,10 +639,10 @@ func main() {
 		stopMu.Lock()
 		stopEvent = true
 		stopMu.Unlock()
-		fmt.Println("\nStopping...")
+		fmt.Println("\n[warn] Stopping gracefully (finish current jobs)...")
 	}()
 
-	fmt.Printf("--- data.go (Pure Go) | Symbol: %s ---\n", Symbol)
+	fmt.Printf("--- data.go (Ryzen 7900X Optimized) | Symbol: %s ---\n", Symbol)
 
 	start, _ := time.Parse("2006-01-02", FallbackDt)
 	end := time.Now().UTC().AddDate(0, 0, -1)
@@ -405,30 +652,32 @@ func main() {
 		return
 	}
 
-	// Generate day list
+	// Generate Job Queue
 	var days []time.Time
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
 		days = append(days, d)
 	}
 
-	fmt.Printf("[job] %d days -> %d threads.\n", len(days), CPUThreads)
+	fmt.Printf("[job] Processing %d days using %d threads.\n", len(days), CPUThreads)
 
-	// Worker Pool
 	jobs := make(chan time.Time, len(days))
 	results := make(chan string, len(days))
 	var wg sync.WaitGroup
 
+	// Workers
 	for i := 0; i < CPUThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for d := range jobs {
+				// Check Stop Signal
 				stopMu.Lock()
 				if stopEvent {
 					stopMu.Unlock()
 					break
 				}
 				stopMu.Unlock()
+
 				results <- processDay(d)
 			}
 		}()
@@ -441,11 +690,13 @@ func main() {
 	wg.Wait()
 	close(results)
 
+	// Stats
 	stats := make(map[string]int)
 	for r := range results {
-		stats[r]++
+		key := strings.Split(r, " ")[0]
+		stats[key]++
 	}
-	fmt.Printf("\n[done] Stats: %v\n", stats)
+	fmt.Printf("\n[done] %v\n", stats)
 }
 
 func processDay(d time.Time) string {
@@ -456,12 +707,21 @@ func processDay(d time.Time) string {
 	idxPath := filepath.Join(dirPath, "index.quantdev")
 	dataPath := filepath.Join(dirPath, "data.quantdev")
 
-	// Check Index
-	if isIndexed(idxPath, dataPath, day) {
+	// 1. Get Directory Lock (Crucial Fix for IO Race)
+	// We allow concurrent DL/Parse, but serialize Index/Data checks & writes per month.
+	muAny, _ := dirLocks.LoadOrStore(dirPath, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+
+	// 2. Check Index (Fast Read)
+	mu.Lock()
+	indexed := isIndexed(idxPath, day)
+	mu.Unlock()
+
+	if indexed {
 		return "skip"
 	}
 
-	// Download
+	// 3. Download (Concurrent / Slow IO)
 	url := fmt.Sprintf("https://%s/%s/daily/%s/%s/%s-%s-%04d-%02d-%02d.zip",
 		HostData, S3Prefix, DataSet, Symbol, Symbol, DataSet, y, m, day)
 
@@ -473,8 +733,8 @@ func processDay(d time.Time) string {
 		return "error_dl"
 	}
 
-	// Parse & Encode
-	aggBlob, count, err := zipToAgg3(d, zipBytes)
+	// 4. Fast Parse (Concurrent / High CPU)
+	aggBlob, count, err := fastZipToAgg3(d, zipBytes)
 	if err != nil {
 		return "error_parse"
 	}
@@ -482,35 +742,44 @@ func processDay(d time.Time) string {
 		return "empty"
 	}
 
-	// Compress (Zlib)
+	// 5. Compress (Concurrent / High CPU)
 	var b bytes.Buffer
-	w := zlib.NewWriter(&b)
+	w, _ := zlib.NewWriterLevel(&b, zlib.BestSpeed) // Level 1 is fastest, sufficient for numbers
 	w.Write(aggBlob)
 	w.Close()
 	compBlob := b.Bytes()
 
-	// Checksum (SHA256)
+	// 6. Checksum (Concurrent)
 	sum := sha256.Sum256(aggBlob)
-	cSum := binary.LittleEndian.Uint64(sum[:8]) // Use first 8 bytes of SHA256
+	cSum := binary.LittleEndian.Uint64(sum[:8])
 
-	// Write (Locking handled by OS append usually, but let's be safe per file if needed.
-	// Since we partition by day, race conditions only happen if multiple threads hit same month.
-	// For simplicity in this port, we rely on atomic appends or create dir first.
-	os.MkdirAll(dirPath, 0755)
+	// 7. Write Data & Update Index (Serialized / Fast IO)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Double check index in case another thread finished this day while we were processing
+	if isIndexed(idxPath, day) {
+		return "skip_race"
+	}
+
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return "error_mkdir"
+	}
 
 	// Append Data
 	fData, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return "error_io"
 	}
-	defer fData.Close()
 
 	stat, _ := fData.Stat()
 	offset := stat.Size()
 
 	if _, err := fData.Write(compBlob); err != nil {
+		fData.Close()
 		return "error_write"
 	}
+	fData.Close() // Close immediately to flush
 
 	// Append Index
 	fIdx, err := os.OpenFile(idxPath, os.O_CREATE|os.O_RDWR, 0644)
@@ -521,15 +790,15 @@ func processDay(d time.Time) string {
 
 	idxStat, _ := fIdx.Stat()
 	if idxStat.Size() == 0 {
-		// Init Header
+		// Init Index Header
 		hdr := make([]byte, 16)
 		copy(hdr[0:], IdxMagic)
 		binary.LittleEndian.PutUint32(hdr[4:], uint32(IdxVersion))
-		binary.LittleEndian.PutUint64(hdr[8:], 0) // count
+		binary.LittleEndian.PutUint64(hdr[8:], 0) // Count = 0
 		fIdx.Write(hdr)
 	}
 
-	// Write Row: Day(2), Offset(8), Length(8), Checksum(8)
+	// Index Row: Day(2), Offset(8), Length(8), Checksum(8) = 26 bytes
 	row := make([]byte, 26)
 	binary.LittleEndian.PutUint16(row[0:], uint16(day))
 	binary.LittleEndian.PutUint64(row[2:], uint64(offset))
@@ -537,13 +806,13 @@ func processDay(d time.Time) string {
 	binary.LittleEndian.PutUint64(row[18:], cSum)
 
 	if _, err := fIdx.Seek(0, io.SeekEnd); err != nil {
-		return "error_idx"
+		return "error_idx_seek"
 	}
 	if _, err := fIdx.Write(row); err != nil {
-		return "error_idx"
+		return "error_idx_write"
 	}
 
-	// Update Count
+	// Increment Index Count (Atomic update under lock)
 	fIdx.Seek(8, io.SeekStart)
 	var currentCount uint64
 	binary.Read(fIdx, binary.LittleEndian, &currentCount)
@@ -553,27 +822,63 @@ func processDay(d time.Time) string {
 	return "ok"
 }
 
+// --- Helpers ---
+
 var errNotFound = fmt.Errorf("404")
 
 func download(url string) ([]byte, error) {
-	for i := 0; i < 5; i++ {
+	// Retry logic optimized for throughput
+	for i := 0; i < 3; i++ {
 		resp, err := httpClient.Get(url)
 		if err == nil {
 			if resp.StatusCode == 200 {
-				defer resp.Body.Close()
-				return io.ReadAll(resp.Body)
+				data, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				return data, err
 			}
 			resp.Body.Close()
 			if resp.StatusCode == 404 {
 				return nil, errNotFound
 			}
 		}
-		time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+		time.Sleep(time.Duration(i+1) * 100 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("timeout")
 }
 
-func zipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
+func isIndexed(idxPath string, day int) bool {
+	f, err := os.Open(idxPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	// Read Header
+	hdr := make([]byte, 16)
+	if _, err := f.Read(hdr); err != nil {
+		return false
+	}
+	if string(hdr[:4]) != IdxMagic {
+		return false
+	}
+	count := binary.LittleEndian.Uint64(hdr[8:])
+
+	// Scan Rows
+	row := make([]byte, 26)
+	// Optimization: If count is huge, this is slow, but for monthly files (max 31 rows), it's instant.
+	for i := uint64(0); i < count; i++ {
+		if _, err := f.Read(row); err != nil {
+			break
+		}
+		if int(binary.LittleEndian.Uint16(row[0:])) == day {
+			return true
+		}
+	}
+	return false
+}
+
+// fastZipToAgg3: Zero-alloc column scanning + Binary Packing
+func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 	r, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		return nil, 0, err
@@ -587,72 +892,118 @@ func zipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 		if err != nil {
 			continue
 		}
-		defer rc.Close()
 
-		csvR := csv.NewReader(rc)
-		headers, err := csvR.Read()
+		// 32GB RAM allows reading full CSV.
+		// For max perf, we read all at once to avoid small IO/syscall overhead.
+		data, err := io.ReadAll(rc)
+		rc.Close()
 		if err != nil {
 			return nil, 0, err
 		}
 
-		// Map headers
-		idxMap := make(map[string]int)
-		for i, h := range headers {
-			idxMap[strings.ToLower(strings.TrimSpace(strings.ReplaceAll(h, "_", "")))] = i
-		}
-
-		get := func(row []string, key string, def int) string {
-			if i, ok := idxMap[key]; ok && i < len(row) {
-				return row[i]
-			}
-			// fallback
-			if def < len(row) {
-				return row[def]
-			}
-			return ""
-		}
-
-		var rows []byte
-		var count uint64
-		var minTs, maxTs int64 = math.MaxInt64, math.MinInt64
+		// Estimation: ~70 bytes CSV -> 48 bytes Bin
+		estRows := len(data) / 50
+		blob := make([]byte, 0, estRows*RowSize)
 		rowBuf := make([]byte, RowSize)
 
-		for {
-			rec, err := csvR.Read()
-			if err == io.EOF {
+		var (
+			minTs int64 = math.MaxInt64
+			maxTs int64 = math.MinInt64
+			count uint64
+
+			// Column Tracking
+			// 0:id, 1:px, 2:qty, 3:fid, 4:lid, 5:ts, 6:m
+			colIdx int
+			start  int
+			i      int
+			n      = len(data)
+		)
+
+		// Skip Header Logic
+		for i < n {
+			if data[i] == '\n' {
+				i++
+				start = i
 				break
 			}
-			if err != nil {
-				continue
+			i++
+		}
+
+		// State Machine Loop
+		for i < n {
+			b := data[i]
+
+			// Fixed: QF1003 tagged switch on b
+			switch b {
+			case ',':
+				// We only parse if we need the column content.
+				// But we parse all for validation/packing.
+				// Slice is zero-copy (view into 'data')
+				colSlice := data[start:i]
+
+				switch colIdx {
+				case 0: // AggID
+					binary.LittleEndian.PutUint64(rowBuf[0:], fastParseUint(colSlice))
+				case 1: // Price
+					binary.LittleEndian.PutUint64(rowBuf[8:], fastParseFloatFixed(colSlice))
+				case 2: // Qty
+					binary.LittleEndian.PutUint64(rowBuf[16:], fastParseFloatFixed(colSlice))
+				case 3: // FirstID
+					binary.LittleEndian.PutUint64(rowBuf[24:], fastParseUint(colSlice))
+				case 4: // LastID -> Count
+					// Need FirstID to calc count. FirstID is already in rowBuf[24:]
+					fid := binary.LittleEndian.Uint64(rowBuf[24:])
+					lid := fastParseUint(colSlice)
+					// Count = Last - First + 1
+					binary.LittleEndian.PutUint32(rowBuf[32:], uint32(lid-fid+1))
+				case 5: // Time
+					ts := fastParseUint(colSlice)
+					binary.LittleEndian.PutUint64(rowBuf[38:], ts)
+					if int64(ts) < minTs {
+						minTs = int64(ts)
+					}
+					if int64(ts) > maxTs {
+						maxTs = int64(ts)
+					}
+				}
+
+				colIdx++
+				start = i + 1
+
+			case '\n':
+				// End of row (Maker Flag)
+				colSlice := data[start:i]
+
+				// Case 6: is_buyer_maker
+				// Check 't' or 'T' (optimized check)
+				flags := uint16(0)
+				if len(colSlice) > 0 {
+					c := colSlice[0]
+					if c == 't' || c == 'T' {
+						flags = 1
+					}
+				}
+				binary.LittleEndian.PutUint16(rowBuf[36:], flags)
+
+				// Append Row
+				blob = append(blob, rowBuf...)
+				count++
+
+				colIdx = 0
+				start = i + 1
 			}
+			i++
+		}
 
-			// Parse
-			ts, _ := strconv.ParseInt(get(rec, "transacttime", 5), 10, 64)
-			tid, _ := strconv.ParseUint(get(rec, "aggtradeid", 0), 10, 64)
-			pxF, _ := strconv.ParseFloat(get(rec, "price", 1), 64)
-			qtyF, _ := strconv.ParseFloat(get(rec, "quantity", 2), 64)
-			fi, _ := strconv.ParseUint(get(rec, "firsttradeid", 3), 10, 64)
-			li, _ := strconv.ParseUint(get(rec, "lasttradeid", 4), 10, 64)
-			isMakerStr := get(rec, "isbuyermaker", 6)
-			isMaker := isMakerStr == "true" || isMakerStr == "True" || isMakerStr == "1"
-
-			cnt := uint32(li - fi + 1)
-			px := uint64(pxF * PxScale)
-			qty := uint64(qtyF * QtScale)
+		// Handle case where file doesn't end with \n
+		if colIdx == 6 && start < n {
+			colSlice := data[start:n]
 			flags := uint16(0)
-			if isMaker {
+			if len(colSlice) > 0 && (colSlice[0] == 't' || colSlice[0] == 'T') {
 				flags = 1
 			}
-
-			if ts < minTs {
-				minTs = ts
-			}
-			if ts > maxTs {
-				maxTs = ts
-			}
-
-			PutRow(rowBuf, tid, px, qty, fi, cnt, flags, ts)
-			rows = append(rows, rowBuf...)
+			binary.LittleEndian.PutUint16(rowBuf[36:], flags)
+			blob = append(blob, rowBuf...)
 			count++
 		}
 
@@ -660,54 +1011,133 @@ func zipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			return nil, 0, nil
 		}
 
-		// Header
-		hdr := make([]byte, HeaderSize)
+		// Header construction (Matches shared.go AggHeader struct: 48 bytes)
+		hdr := make([]byte, HeaderSize) // HeaderSize is 48 from shared.go
 		copy(hdr[0:], AggMagic)
 		hdr[4] = 1
 		hdr[5] = uint8(t.Day())
-		binary.LittleEndian.PutUint16(hdr[6:], 3) // zlvl
+		binary.LittleEndian.PutUint16(hdr[6:], 3) // zlib level (informational)
 		binary.LittleEndian.PutUint64(hdr[8:], count)
 		binary.LittleEndian.PutUint64(hdr[16:], uint64(minTs))
 		binary.LittleEndian.PutUint64(hdr[24:], uint64(maxTs))
+		// Bytes 32-47 are padding (zero initialized by make)
 
-		return append(hdr, rows...), count, nil
+		return append(hdr, blob...), count, nil
 	}
 	return nil, 0, fmt.Errorf("no csv")
 }
 
-func isIndexed(idxPath, dataPath string, day int) bool {
-	f, err := os.Open(idxPath)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
+// --- High Performance Parsers (No Alloc) ---
 
-	// Check Header
-	hdr := make([]byte, 16)
-	if _, err := f.Read(hdr); err != nil {
-		return false
+func fastParseUint(b []byte) uint64 {
+	var n uint64
+	for _, c := range b {
+		// Rely on valid ASCII digits 0-9
+		n = n*10 + uint64(c-'0')
 	}
-	if string(hdr[:4]) != IdxMagic {
-		return false
-	}
-	count := binary.LittleEndian.Uint64(hdr[8:])
+	return n
+}
 
-	// Scan rows (26 bytes each)
-	row := make([]byte, 26)
-	for i := uint64(0); i < count; i++ {
-		if _, err := f.Read(row); err != nil {
-			break
+// Converts "123.45" -> 12345000000 (scaled 1e8)
+func fastParseFloatFixed(b []byte) uint64 {
+	var n uint64
+	seenDot := false
+	decimals := 0
+
+	for _, c := range b {
+		if c == '.' {
+			seenDot = true
+			continue
 		}
-		d := binary.LittleEndian.Uint16(row[0:])
-		if int(d) == day {
-			return true
+		// Branchless logic possible, but this is fast enough for memory-bound tasks
+		n = n*10 + uint64(c-'0')
+		if seenDot {
+			decimals++
 		}
 	}
-	return false
+
+	// Adjust Scale 1e8
+	const target = 8
+	if decimals < target {
+		// Hand-rolled power of 10 for small N is faster than math.Pow
+		for i := 0; i < (target - decimals); i++ {
+			n *= 10
+		}
+	} else if decimals > target {
+		for i := 0; i < (decimals - target); i++ {
+			n /= 10
+		}
+	}
+	return n
 }
 ```
 
 // --- End File: data.go ---
+
+// --- File: main.go ---
+
+```go
+// main.go
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"time"
+)
+
+func main() {
+	// 1. Windows/Ryzen Optimization: High Priority Class
+	// This ensures the OS scheduler prioritizes your Quant/HFT threads
+	runtime.GOMAXPROCS(24) // Pin to your 24 logical threads
+
+	if len(os.Args) < 2 {
+		printHelp()
+		os.Exit(1)
+	}
+
+	start := time.Now()
+	cmd := os.Args[1]
+
+	// 2. The Dispatcher (Zero-Allocation Switch)
+	switch cmd {
+	case "data":
+		runData()
+	case "build":
+		runBuild()
+	case "sanity":
+		runSanity()
+	case "study":
+		runStudy()
+	case "sum":
+		runSum()
+	default:
+		fmt.Printf("Unknown command: %s\n", cmd)
+		printHelp()
+		os.Exit(1)
+	}
+
+	// 3. Performance telemetry
+	fmt.Printf("\n[sys] Execution Time: %s | Mem: %s\n", time.Since(start), getMemUsage())
+}
+
+func printHelp() {
+	fmt.Println("Usage: quant.exe [command]")
+	fmt.Println("  data   - Download Binance AggTrades")
+	fmt.Println("  build  - Generate Alpha Features")
+	fmt.Println("  study  - Analyze Signal Decay")
+	fmt.Println("  sum    - Summary Report")
+}
+
+func getMemUsage() string {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return fmt.Sprintf("%d MB", m.Alloc/1024/1024)
+}
+```
+
+// --- End File: main.go ---
 
 // --- File: sanity.go ---
 
@@ -726,10 +1156,8 @@ import (
 	"sync"
 )
 
-const Symbol = "BTCUSDT"
-
-func main() {
-	root := filepath.Join("data", Symbol)
+func runSanity() {
+	root := filepath.Join(BaseDir, Symbol)
 	dirs, _ := os.ReadDir(root)
 
 	var tasks []string
@@ -784,11 +1212,9 @@ func validateMonth(dir string) {
 	}
 	defer fData.Close()
 
-	// Read Index Header
 	hdr := make([]byte, 16)
 	fIdx.Read(hdr)
 	count := binary.LittleEndian.Uint64(hdr[8:])
-
 	row := make([]byte, 26)
 	issues := 0
 
@@ -802,7 +1228,6 @@ func validateMonth(dir string) {
 		fData.Seek(offset, 0)
 		fData.Read(compData)
 
-		// Decompress
 		r, err := zlib.NewReader(bytes.NewReader(compData))
 		if err != nil {
 			issues++
@@ -811,386 +1236,722 @@ func validateMonth(dir string) {
 		aggBlob, _ := io.ReadAll(r)
 		r.Close()
 
-		// Checksum
 		s := sha256.Sum256(aggBlob)
-		actSum := binary.LittleEndian.Uint64(s[:8])
-		if actSum != expSum {
+		if binary.LittleEndian.Uint64(s[:8]) != expSum {
 			issues++
 			continue
 		}
 
-		// Header Check
 		if len(aggBlob) < HeaderSize {
 			issues++
 			continue
 		}
-		rowCount := binary.LittleEndian.Uint64(aggBlob[8:])
-		if uint64(len(aggBlob)) != HeaderSize+rowCount*RowSize {
+		if uint64(len(aggBlob)) != HeaderSize+binary.LittleEndian.Uint64(aggBlob[8:])*RowSize {
 			issues++
 		}
 	}
 
 	if issues > 0 {
 		fmt.Printf("ISSUES: %s (%d errors)\n", dir, issues)
-	} else {
-		// fmt.Printf("OK: %s\n", dir)
 	}
 }
 ```
 
 // --- End File: sanity.go ---
 
-// --- File: shared.go ---
+// --- File: scorecard.go ---
 
 ```go
 package main
 
 import (
-	"encoding/binary"
+	"encoding/json"
 	"math"
+	"os"
 	"sort"
 )
 
-// --- Constants ---
-const (
-	CPUThreads = 24
-	PxScale    = 100_000_000.0
-	QtScale    = 100_000_000.0
-	AggMagic   = "AGG3"
-	IdxMagic   = "QIDX"
-	IdxVersion = 1
-)
+// --- Master Data Structure ---
 
-// --- Structs (Binary Layouts) ---
-
-// AGG3 Header: magic(4), ver(1), day(1), zlvl(2), count(8), min_ts(8), max_ts(8), pad(16)
-// Total: 48 bytes
-const HeaderSize = 48
-
-type AggHeader struct {
-	Magic    [4]byte
-	Version  uint8
-	Day      uint8
-	ZLevel   uint16
-	RowCount uint64
-	MinTs    int64
-	MaxTs    int64
-	Padding  [16]byte
+type AlphaResult struct {
+	Date          string             `json:"date"`
+	NBars         int                `json:"n_bars"`
+	SignalQuality SignalQuality      `json:"signal_quality"`
+	Horizons      map[string]Horizon `json:"horizons"` // "20", "50", "100"
 }
 
-// AGG3 Row: 48 bytes
-// trade_id(8), px(8), qty(8), first_id(8), count(4), flags(2), ts(8), pad(2)
-const RowSize = 48
-
-// Feature Row: 24 bytes
-// ts(8), price(8), signal(8)
-const FeatureSize = 24
-
-// --- Math Helpers ---
-
-func Mean(vals []float64) float64 {
-	if len(vals) == 0 {
-		return 0.0
-	}
-	sum := 0.0
-	for _, v := range vals {
-		sum += v
-	}
-	return sum / float64(len(vals))
+type SignalQuality struct {
+	Mean        float64 `json:"mean"`
+	StdDev      float64 `json:"std_dev"`
+	Skew        float64 `json:"skew"`
+	Kurtosis    float64 `json:"kurtosis"`
+	PctOutliers float64 `json:"pct_outliers"` // > 3 std
+	Autocorr    float64 `json:"autocorr_lag1"`
+	Turnover    float64 `json:"est_turnover_per_bar"` // |S_t - S_t-1|
 }
 
-func StdDev(vals []float64, mean float64) float64 {
-	if len(vals) < 2 {
-		return 0.0
-	}
-	sumSq := 0.0
-	for _, v := range vals {
-		d := v - mean
-		sumSq += d * d
-	}
-	return math.Sqrt(sumSq / float64(len(vals)-1))
+type Horizon struct {
+	ICPearson         float64 `json:"ic_pearson"`
+	ICSpearman        float64 `json:"ic_spearman"`
+	Beta              float64 `json:"beta"`
+	TStat             float64 `json:"t_stat"`
+	DecileSpreadBps   float64 `json:"decile_spread_bps"`
+	BreakevenBps      float64 `json:"breakeven_cost_bps"` // The God Metric
+	TheoreticalSharpe float64 `json:"theoretical_sharpe"`
 }
 
-func Correlation(x, y []float64) float64 {
-	n := len(x)
-	if n != len(y) || n == 0 {
-		return 0.0
+// --- The Calculator ---
+
+// CalculateAlphaMetrics runs the full suite for a specific horizon
+func CalculateAlphaMetrics(sig, ret []float64) Horizon {
+	h := Horizon{}
+	n := len(sig)
+	if n < 100 {
+		return h
 	}
-	mx, my := Mean(x), Mean(y)
-	sxx, syy, sxy := 0.0, 0.0, 0.0
+
+	// 1. Predictive Power (IC)
+	h.ICPearson = Correlation(sig, ret)
+	h.ICSpearman = SpearmanCorrelation(sig, ret)
+
+	// 2. Regression (Alpha/Beta)
+	alpha, beta := SimpleOLS(sig, ret)
+	h.Beta = beta
+
+	// T-Stat calculation
+	rss := 0.0
+	sx := 0.0
+	mx := Mean(sig)
 	for i := 0; i < n; i++ {
-		dx := x[i] - mx
-		dy := y[i] - my
-		sxx += dx * dx
-		syy += dy * dy
-		sxy += dx * dy
+		pred := alpha + beta*sig[i]
+		resid := ret[i] - pred
+		rss += resid * resid
+		d := sig[i] - mx
+		sx += d * d
 	}
-	if sxx == 0 || syy == 0 {
-		return 0.0
+	stdErr := math.Sqrt(rss / float64(n-2))
+	if sx > 0 {
+		h.TStat = beta / (stdErr / math.Sqrt(sx))
 	}
-	return sxy / math.Sqrt(sxx*syy)
+
+	// 3. Monotonicity (Decile Spread)
+	h.DecileSpreadBps = CalcQuantileSpread(sig, ret, 10) * 10000
+
+	// 4. Breakeven Cost (The most important HFT metric)
+	// PnL = Sum(Sig * Ret)
+	// Turnover = Sum(|Sig_t - Sig_t-1|)
+	// BE = PnL / Turnover
+	totalPnL := 0.0
+	totalTurnover := 0.0
+	for i := 0; i < n-1; i++ {
+		totalPnL += sig[i] * ret[i]
+		if i > 0 {
+			totalTurnover += math.Abs(sig[i] - sig[i-1])
+		}
+	}
+	if totalTurnover > 0 {
+		h.BreakevenBps = (totalPnL / totalTurnover) * 10000
+	}
+
+	// 5. Theoretical Annualized Sharpe (Mark-to-Mid)
+	// Assuming 5-min bars? Or tick bars?
+	// We generalize: Sharpe = Mean(PnL) / Std(PnL) * Sqrt(N)
+	pnl := make([]float64, n)
+	for i := 0; i < n; i++ {
+		pnl[i] = sig[i] * ret[i]
+	}
+	mPnl := Mean(pnl)
+	sPnl := StdDev(pnl, mPnl) // Corrected: Uses shared.go StdDev(vals, mean)
+	if sPnl > 0 {
+		// Annualize assuming roughly 100k ticks/day for HFT or just per-bar
+		// For comparison, we just output per-root-N
+		h.TheoreticalSharpe = (mPnl / sPnl) * math.Sqrt(float64(n))
+	}
+
+	return h
 }
 
-func Percentile(sorted []float64, p float64) float64 {
-	n := len(sorted)
+// AnalyzeSignalQuality checks the "Health" of the alpha
+func AnalyzeSignalQuality(sig []float64) SignalQuality {
+	sq := SignalQuality{}
+	n := len(sig)
 	if n == 0 {
-		return 0.0
+		return sq
 	}
-	if p <= 0 {
-		return sorted[0]
+
+	// Moments
+	sq.Mean = Mean(sig)
+	sq.StdDev = StdDev(sig, sq.Mean) // Corrected: Uses shared.go StdDev(vals, mean)
+
+	m3, m4 := 0.0, 0.0
+	outliers := 0
+	sumDiff := 0.0
+
+	for i, v := range sig {
+		d := 0.0
+		if sq.StdDev > 0 {
+			d = (v - sq.Mean) / sq.StdDev
+		}
+		m3 += d * d * d
+		m4 += d * d * d * d
+		if math.Abs(d) > 3.0 {
+			outliers++
+		}
+
+		// Turnover proxy
+		if i > 0 {
+			sumDiff += math.Abs(v - sig[i-1])
+		}
 	}
-	if p >= 100 {
-		return sorted[n-1]
-	}
-	k := (p / 100.0) * float64(n-1)
-	f := math.Floor(k)
-	c := math.Ceil(k)
-	if f == c {
-		return sorted[int(k)]
-	}
-	d0 := sorted[int(f)] * (c - k)
-	d1 := sorted[int(c)] * (k - f)
-	return d0 + d1
+
+	sq.Skew = m3 / float64(n)
+	sq.Kurtosis = (m4 / float64(n)) - 3.0
+	sq.PctOutliers = float64(outliers) / float64(n)
+	sq.Turnover = sumDiff / float64(n)
+	sq.Autocorr = AutoCorrelation(sig, 1)
+
+	return sq
 }
 
-// RankData implements rankdata (average rank for ties)
-func RankData(vals []float64) []float64 {
-	n := len(vals)
-	type Item struct {
-		Val float64
-		Idx int
-	}
-	items := make([]Item, n)
-	for i, v := range vals {
-		items[i] = Item{v, i}
-	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].Val < items[j].Val
-	})
+// --- Math Helpers (Optimized) ---
 
+// NOTE: Mean, StdDev, and Correlation removed to resolve conflicts with shared.go
+
+func AutoCorrelation(x []float64, lag int) float64 {
+	n := len(x)
+	if lag >= n {
+		return 0
+	}
+	return Correlation(x[:n-lag], x[lag:])
+}
+
+func SimpleOLS(x, y []float64) (alpha, beta float64) {
+	mx, my := Mean(x), Mean(y)
+	num, den := 0.0, 0.0
+	for i := 0; i < len(x); i++ {
+		dx := x[i] - mx
+		num += dx * (y[i] - my)
+		den += dx * dx
+	}
+	if den == 0 {
+		return 0, 0
+	}
+	beta = num / den
+	alpha = my - beta*mx
+	return
+}
+
+type rankPair struct {
+	val float64
+	idx int
+}
+
+func SpearmanCorrelation(x, y []float64) float64 {
+	rx := getRanks(x)
+	ry := getRanks(y)
+	return Correlation(rx, ry)
+}
+
+func getRanks(v []float64) []float64 {
+	n := len(v)
+	pairs := make([]rankPair, n)
+	for i, val := range v {
+		pairs[i] = rankPair{val, i}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].val < pairs[j].val })
 	ranks := make([]float64, n)
-	i := 0
-	for i < n {
-		j := i + 1
-		for j < n && items[j].Val == items[i].Val {
-			j++
-		}
-		// Span is [i, j)
-		count := float64(j - i)
-		// Average rank = (sum of positions) / count
-		// positions are i+1, i+2, ..., i+count
-		// sum = (count/2) * (2*(i+1) + (count-1))
-		avgRank := float64(i+1) + (count-1.0)/2.0
-
-		for k := i; k < j; k++ {
-			ranks[items[k].Idx] = avgRank
-		}
-		i = j
+	for i, p := range pairs {
+		ranks[p.idx] = float64(i + 1)
 	}
 	return ranks
 }
 
-// --- Binary Helpers (High Performance) ---
-
-func PutRow(buf []byte, tid, px, qty, fid uint64, cnt uint32, flags uint16, ts int64) {
-	binary.LittleEndian.PutUint64(buf[0:], tid)
-	binary.LittleEndian.PutUint64(buf[8:], px)
-	binary.LittleEndian.PutUint64(buf[16:], qty)
-	binary.LittleEndian.PutUint64(buf[24:], fid)
-	binary.LittleEndian.PutUint32(buf[32:], cnt)
-	binary.LittleEndian.PutUint16(buf[36:], flags)
-	binary.LittleEndian.PutUint64(buf[38:], uint64(ts))
-	// Padding 2 bytes at 46 left zero
+func CalcQuantileSpread(sig, ret []float64, buckets int) float64 {
+	n := len(sig)
+	pairs := make([]rankPair, n)
+	for i, val := range sig {
+		pairs[i] = rankPair{val, i}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].val < pairs[j].val })
+	sz := n / buckets
+	if sz == 0 {
+		return 0
+	}
+	sumBot, sumTop := 0.0, 0.0
+	for i := 0; i < sz; i++ {
+		sumBot += ret[pairs[i].idx]
+	}
+	for i := n - sz; i < n; i++ {
+		sumTop += ret[pairs[i].idx]
+	}
+	return (sumTop / float64(sz)) - (sumBot / float64(sz))
 }
 
-func ReadRow(buf []byte) (tid, px, qty, fid uint64, cnt uint32, flags uint16, ts int64) {
-	_ = buf[47] // Bounds check hint
-	tid = binary.LittleEndian.Uint64(buf[0:])
-	px = binary.LittleEndian.Uint64(buf[8:])
-	qty = binary.LittleEndian.Uint64(buf[16:])
-	fid = binary.LittleEndian.Uint64(buf[24:])
-	cnt = binary.LittleEndian.Uint32(buf[32:])
-	flags = binary.LittleEndian.Uint16(buf[36:])
-	ts = int64(binary.LittleEndian.Uint64(buf[38:]))
-	return
+func SaveReport(report []AlphaResult, path string) {
+	f, _ := os.Create(path)
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	enc.Encode(report)
 }
 ```
 
-// --- End File: shared.go ---
+// --- End File: scorecard.go ---
 
-// --- File: studyalpha.go ---
+// --- File: study.go ---
 
 ```go
 package main
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 )
 
-// Config matches Python
-const (
-	Year    = 2024
-	Month   = 1
-	BaseDir = "data"
-	Symbol  = "BTCUSDT"
-)
+// --- Configuration ---
+// We study 3 distinct horizons to check Alpha Decay
+var Horizons = []int{20, 50, 100}
 
-var Horizons = []int{20, 50, 100, 200}
+// REALITY CHECK: Execution Latency (Network + Gateway + Matching Engine)
+const ExecutionLagMS = 70 // 70ms accurate lag
 
-func main() {
-	featDir := filepath.Join(BaseDir, "features", Symbol, fmt.Sprintf("%04d", Year), fmt.Sprintf("%02d", Month))
-	files, _ := os.ReadDir(featDir)
+func runStudy() {
+	start := time.Now()
+	featDir := filepath.Join(BaseDir, "features", Symbol)
 
-	type Job struct {
-		Path string
-		Name string
-	}
-	jobs := make(chan Job, len(files))
-	for _, f := range files {
-		if filepath.Ext(f.Name()) == ".bin" {
-			jobs <- Job{filepath.Join(featDir, f.Name()), f.Name()}
+	// 1. Gather Files
+	var files []string
+	years, _ := os.ReadDir(featDir)
+	for _, y := range years {
+		if y.IsDir() {
+			months, _ := os.ReadDir(filepath.Join(featDir, y.Name()))
+			for _, m := range months {
+				if m.IsDir() {
+					days, _ := os.ReadDir(filepath.Join(featDir, y.Name(), m.Name()))
+					for _, d := range days {
+						if filepath.Ext(d.Name()) == ".bin" {
+							files = append(files, filepath.Join(featDir, y.Name(), m.Name(), d.Name()))
+						}
+					}
+				}
+			}
 		}
 	}
-	close(jobs)
 
+	fmt.Printf("--- study.go | Analyzing %d Days | Lag: %dms ---\n", len(files), ExecutionLagMS)
+
+	// 2. Parallel Processing (Ryzen 7900X Saturation)
+	jobs := make(chan string, len(files))
+	// FIX: Use AlphaResult (from scorecard.go), not reportEntry
+	results := make(chan AlphaResult, len(files))
 	var wg sync.WaitGroup
-	results := make(chan DayResult, len(files))
 
+	// Workers
 	for i := 0; i < CPUThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := range jobs {
-				results <- analyzeDay(j.Path, j.Name)
+			for path := range jobs {
+				results <- analyzeFile(path)
 			}
 		}()
 	}
+
+	for _, f := range files {
+		jobs <- f
+	}
+	close(jobs)
 	wg.Wait()
 	close(results)
 
-	// Aggregate
-	var allRes []DayResult
+	// 3. Aggregation
+	var report []AlphaResult
+	meanIC50 := 0.0
+	meanBE50 := 0.0
+	valid := 0
+
 	for r := range results {
-		allRes = append(allRes, r)
-	}
-	sort.Slice(allRes, func(i, j int) bool { return allRes[i].Name < allRes[j].Name })
-
-	// Report
-	report := GlobalReport{
-		Symbol:   Symbol,
-		Year:     Year,
-		Month:    Month,
-		Horizons: Horizons,
-		Days:     make(map[string]DayResult),
-	}
-
-	fmt.Printf("%-5s | %10s | %8s | %8s\n", "DAY", "TICKS", "IC(20)", "SHARPE")
-	fmt.Println("----------------------------------------")
-
-	for _, r := range allRes {
-		report.Days[r.Name] = r
-		ic := 0.0
-		if v, ok := r.ICTerm["20"]; ok {
-			ic = v
+		if r.NBars > 0 {
+			report = append(report, r)
+			if h50, ok := r.Horizons["50"]; ok {
+				meanIC50 += h50.ICPearson
+				meanBE50 += h50.BreakevenBps
+				valid++
+			}
 		}
-		fmt.Printf("%-5s | %10d | %8.4f | %8.2f\n", r.Name, r.Ticks, ic, r.Sharpe)
 	}
 
-	outPath := filepath.Join(BaseDir, "reports", "alpha_summary.json")
+	// Sort by date for the JSON report
+	sort.Slice(report, func(i, j int) bool { return report[i].Date < report[j].Date })
+
+	if valid > 0 {
+		fmt.Printf("DONE in %s\n", time.Since(start))
+		fmt.Printf("Global Mean IC (50 ticks, %dms lag): %.4f\n", ExecutionLagMS, meanIC50/float64(valid))
+		fmt.Printf("Global Mean Breakeven (50 ticks): %.4f bps\n", meanBE50/float64(valid))
+	}
+
+	outPath := filepath.Join(BaseDir, "reports", fmt.Sprintf("alpha_core_%s.json", Symbol))
 	os.MkdirAll(filepath.Dir(outPath), 0755)
-	f, _ := os.Create(outPath)
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	enc.Encode(report)
-	f.Close()
-	fmt.Println("\nJSON Written to", outPath)
+
+	// FIX: SaveReport now accepts []AlphaResult correctly
+	SaveReport(report, outPath)
+	fmt.Println("Report saved:", outPath)
 }
 
-type DayResult struct {
-	Name   string
-	Ticks  int
-	ICTerm map[string]float64
-	Sharpe float64
-}
+// FIX: Return AlphaResult to match scorecard.go
+func analyzeFile(path string) AlphaResult {
+	// 1. Read Binary
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return AlphaResult{NBars: 0}
+	}
 
-type GlobalReport struct {
-	Symbol   string
-	Year     int
-	Month    int
-	Horizons []int
-	Days     map[string]DayResult
-}
-
-func analyzeDay(path, name string) DayResult {
-	data, _ := os.ReadFile(path)
 	n := len(data) / FeatureSize
+	maxHorizon := Horizons[len(Horizons)-1]
 
-	ts := make([]int64, n)
-	px := make([]float64, n)
-	sig := make([]float64, n)
+	// Basic length check (very rough)
+	if n < maxHorizon+100 {
+		return AlphaResult{NBars: 0}
+	}
+
+	// 2. Unpack into Separate Slices (SoA layout for cache efficiency)
+	// We need Timestamps now for accurate lagging
+	timestamps := make([]int64, n)
+	prices := make([]float64, n)
+	signals := make([]float64, n)
 
 	for i := 0; i < n; i++ {
 		off := i * FeatureSize
-		ts[i] = int64(binary.LittleEndian.Uint64(data[off:]))
-		px[i] = math.Float64frombits(binary.LittleEndian.Uint64(data[off+8:]))
-		sig[i] = math.Float64frombits(binary.LittleEndian.Uint64(data[off+16:]))
+		// Layout: [Ts(8) | Px(8) | Sig(8)]
+		tsRaw := binary.LittleEndian.Uint64(data[off:])
+		pxRaw := binary.LittleEndian.Uint64(data[off+8:])
+		sigRaw := binary.LittleEndian.Uint64(data[off+16:])
+
+		timestamps[i] = int64(tsRaw)
+		prices[i] = math.Float64frombits(pxRaw)
+		signals[i] = math.Float64frombits(sigRaw)
 	}
 
-	res := DayResult{Name: name, Ticks: n, ICTerm: make(map[string]float64)}
+	// 3. Date ID
+	base := filepath.Base(path)
+	dir := filepath.Base(filepath.Dir(path))
+	year := filepath.Base(filepath.Dir(filepath.Dir(path)))
+	dateID := fmt.Sprintf("%s-%s-%s", year, dir, base[:len(base)-4])
 
-	if n < 500 {
-		return res
+	// FIX: Use struct from scorecard.go
+	res := AlphaResult{
+		Date:          dateID,
+		NBars:         n,
+		SignalQuality: AnalyzeSignalQuality(signals), // This now matches types
+		Horizons:      make(map[string]Horizon),      // This now matches types
 	}
 
-	// Calc ICs
+	// 4. Horizon Loops with TIME-BASED LAG
 	for _, h := range Horizons {
-		if n <= h {
-			continue
+		var subSig []float64
+		var futureRet []float64
+
+		// Pre-allocate to avoid resize overhead (guess approx size)
+		estSize := n - h
+		if estSize > 0 {
+			subSig = make([]float64, 0, estSize)
+			futureRet = make([]float64, 0, estSize)
 		}
-		var s, r []float64
-		for i := 0; i < n-h; i++ {
-			p0 := px[i]
-			p1 := px[i+h]
-			if p0 > 0 {
-				ret := (p1 - p0) / p0
-				s = append(s, sig[i])
-				r = append(r, ret)
+
+		// Sliding Window Cursor for Entry
+		entryIdx := 0
+
+		for i := 0; i < n; i++ {
+			// Signal is generated at Time(i)
+			genTime := timestamps[i]
+
+			// We cannot execute until Time(i) + 70ms
+			targetEntryTime := genTime + ExecutionLagMS
+
+			// Fast-forward the entry cursor to find the first trade >= targetEntryTime
+			if entryIdx < i {
+				entryIdx = i
+			}
+			for entryIdx < n && timestamps[entryIdx] < targetEntryTime {
+				entryIdx++
+			}
+
+			// If entry index + horizon is out of bounds, we stop processing this horizon
+			if entryIdx+h >= n {
+				break
+			}
+
+			// Capture valid pair
+			// Signal was from index 'i'
+			// Entry Price is at 'entryIdx' (Delayed by 70ms)
+			// Exit Price is at 'entryIdx + h' (N ticks after Entry)
+
+			pEntry := prices[entryIdx]
+			pExit := prices[entryIdx+h]
+
+			if pEntry > 0 {
+				subSig = append(subSig, signals[i])
+				futureRet = append(futureRet, (pExit-pEntry)/pEntry)
 			}
 		}
-		res.ICTerm[fmt.Sprintf("%d", h)] = Correlation(s, r)
-	}
 
-	// Strategy (Horizon 20)
-	h := 20
-	var pnl []float64
-	for i := 0; i < n-h; i++ {
-		p0 := px[i]
-		p1 := px[i+h]
-		if p0 > 0 && sig[i] != 0 {
-			ret := (p1 - p0) / p0
-			pnl = append(pnl, sig[i]*ret)
-		}
-	}
-
-	if len(pnl) > 1 {
-		mu := Mean(pnl)
-		std := StdDev(pnl, mu)
-		if std > 1e-9 {
-			scale := math.Sqrt(365 * 24 * 60 * 6) // annualize
-			res.Sharpe = (mu / std) * scale
-		}
+		// Calc stats for this horizon
+		// FIX: Correct types passed to CalculateAlphaMetrics
+		res.Horizons[fmt.Sprintf("%d", h)] = CalculateAlphaMetrics(subSig, futureRet)
 	}
 
 	return res
 }
 ```
 
-// --- End File: studyalpha.go ---
+// --- End File: study.go ---
+
+// --- File: sum.go ---
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"text/tabwriter"
+	"time"
+)
+
+// --- Configuration ---
+const (
+	ReportPath = "data/reports/alpha_core_BTCUSDT.json"
+	TargetHz   = "50" // We summarize the 50-tick horizon
+)
+
+// --- JSON Structures (Renamed to avoid conflicts) ---
+// We use distinct names so they don't clash with scorecard.go
+type reportEntry struct {
+	Date          string                   `json:"date"`
+	NBars         int                      `json:"n_bars"`
+	SignalQuality reportQuality            `json:"signal_quality"`
+	Horizons      map[string]reportHorizon `json:"horizons"`
+}
+
+type reportQuality struct {
+	Turnover float64 `json:"est_turnover_per_bar"`
+}
+
+type reportHorizon struct {
+	ICPearson         float64 `json:"ic_pearson"`
+	BreakevenBps      float64 `json:"breakeven_cost_bps"`
+	TheoreticalSharpe float64 `json:"theoretical_sharpe"`
+	DecileSpreadBps   float64 `json:"decile_spread_bps"`
+}
+
+// runSum is the new entry point (renamed from main)
+func runSum() {
+	// 1. Setup Input
+	path := filepath.FromSlash(ReportPath)
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Printf("Error opening report: %v. Have you run 'study' yet?\n", err)
+		return
+	}
+	defer f.Close()
+
+	// 2. Streaming Decode (Memory Optimization)
+	dec := json.NewDecoder(f)
+
+	// Read opening bracket '['
+	if _, err := dec.Token(); err != nil {
+		// If file is empty or invalid JSON
+		fmt.Println("Error: Invalid JSON format or empty report.")
+		return
+	}
+
+	// 3. Aggregation State
+	var (
+		count       int
+		totalBars   int64
+		sumIC       float64
+		sumBE       float64
+		sumSharpe   float64
+		sumSpread   float64
+		sumTurnover float64
+		posDays     int
+		startDate   string
+		endDate     string
+	)
+
+	startT := time.Now()
+
+	// 4. Processing Loop
+	for dec.More() {
+		var res reportEntry
+		if err := dec.Decode(&res); err != nil {
+			break
+		}
+
+		if count == 0 {
+			startDate = res.Date
+		}
+		endDate = res.Date
+
+		// Extract metrics for the target horizon
+		if h, ok := res.Horizons[TargetHz]; ok {
+			count++
+			totalBars += int64(res.NBars)
+
+			sumIC += h.ICPearson
+			sumBE += h.BreakevenBps
+			sumSharpe += h.TheoreticalSharpe
+			sumSpread += h.DecileSpreadBps
+			sumTurnover += res.SignalQuality.Turnover
+
+			if h.ICPearson > 0 {
+				posDays++
+			}
+		}
+	}
+
+	// 5. Compute Final Stats
+	if count == 0 {
+		fmt.Println("No valid data found for horizon " + TargetHz)
+		return
+	}
+
+	n := float64(count)
+	avgIC := sumIC / n
+	avgBE := sumBE / n
+	avgSharpe := sumSharpe / n
+	avgSpread := sumSpread / n
+	avgTurnover := sumTurnover / n
+	winRate := (float64(posDays) / n) * 100.0
+
+	// 6. Output Generation
+	fmt.Printf("\n--- ALPHA SUMMARY REPORT | %s ---\n", filepath.Base(path))
+	fmt.Printf("Processing Time: %s | Target Horizon: %s ticks\n\n", time.Since(startT), TargetHz)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+
+	// Section: General
+	fmt.Fprintf(w, "METRIC\tVALUE\tDESCRIPTION\n")
+	fmt.Fprintf(w, "---\t---\t---\n")
+	fmt.Fprintf(w, "Date Range\t%s to %s\tScan duration\n", startDate, endDate)
+	fmt.Fprintf(w, "Total Days\t%d\tValid trading days\n", count)
+	fmt.Fprintf(w, "Total Bars\t%d\tTotal observations\n", totalBars)
+
+	// Section: Performance
+	fmt.Fprintf(w, "\nPERFORMANCE\t\t\n")
+	fmt.Fprintf(w, "---\t\t\n")
+	fmt.Fprintf(w, "Mean IC (Pearson)\t%.4f\tPredictive correlation\n", avgIC)
+	fmt.Fprintf(w, "Mean Sharpe\t%.2f\tDaily theoretical sharpe\n", avgSharpe)
+	fmt.Fprintf(w, "Win Rate (Days)\t%.1f%%\tPercent positive IC days\n", winRate)
+
+	// Section: Costs & Execution
+	fmt.Fprintf(w, "\nEXECUTION\t\t\n")
+	fmt.Fprintf(w, "---\t\t\n")
+	fmt.Fprintf(w, "Avg Breakeven\t%.2f bps\tCost required to kill alpha\n", avgBE)
+	fmt.Fprintf(w, "Decile Spread\t%.2f bps\tTop minus Bottom decile return\n", avgSpread)
+	fmt.Fprintf(w, "Avg Turnover\t%.2f\tEst. portfolio rotation per bar\n", avgTurnover)
+
+	w.Flush()
+	fmt.Println("")
+}
+```
+
+// --- End File: sum.go ---
+
+// --- File: data\reports\alpha_core_BTCUSDT.json ---
+
+```json
+[
+  {
+    "date": "2020-01-01",
+    "n_bars": 71358,
+    "signal_quality": {
+      "mean": -0.04843281761750522,
+      "std_dev": 0.45081011617289385,
+      "skew": -0.5630113167157769,
+      "kurtosis": 2.295932054706541,
+      "pct_outliers": 0.0083522520250007,
+      "autocorr_lag1": 0.935258220761275,
+      "est_turnover_per_bar": 0.06873188243368296
+    },
+    "horizons": {
+      "100": {
+        "ic_pearson": 0.03429132856732867,
+        "ic_spearman": 0.03405026143560506,
+        "beta": 0.00003836196381934968,
+        "t_stat": 9.158730633005744,
+        "decile_spread_bps": 0.39486678251906915,
+        "breakeven_cost_bps": 1.103427124404336,
+        "theoretical_sharpe": 8.930891754235507
+      },
+      "20": {
+        "ic_pearson": 0.03598478860271959,
+        "ic_spearman": 0.017871477175451383,
+        "beta": 0.000017223315969847984,
+        "t_stat": 9.61719920130428,
+        "decile_spread_bps": 0.19208782936490687,
+        "breakeven_cost_bps": 0.48896059798515124,
+        "theoretical_sharpe": 8.740757270599119
+      },
+      "50": {
+        "ic_pearson": 0.03868349940669228,
+        "ic_spearman": 0.031942771488788727,
+        "beta": 0.00003100695463951978,
+        "t_stat": 10.337390731983858,
+        "decile_spread_bps": 0.28843401443726785,
+        "breakeven_cost_bps": 0.9016667509183796,
+        "theoretical_sharpe": 10.058593302873481
+      }
+    }
+  },
+  {
+    "date": "2020-01-02",
+    "n_bars": 160453,
+    "signal_quality": {
+      "mean": 0.053598180944820696,
+      "std_dev": 0.4642407365705559,
+      "skew": -0.46142257224489874,
+      "kurtosis": 1.7597911229854475,
+      "pct_outliers": 0.008126990458265038,
+      "autocorr_lag1": 0.9437803088351316,
+      "est_turnover_per_bar": 0.06098461930277103
+    },
+    "horizons": {
+      "100": {
+        "ic_pearson": 0.05293840324202217,
+        "ic_spearman": 0.04369104514651595,
+        "beta": 0.00005912704634599912,
+        "t_stat": 21.228143529715908,
+        "decile_spread_bps": 0.7769827346439058,
+        "breakeven_cost_bps": 1.910051403398231,
+        "theoretical_sharpe": 17.974941723735206
+      },
+      "20": {
+        "ic_pearson": 0.017366229689143083,
+        "ic_spearman": 0.004633978261264546,
+        "beta": 0.000008527182655862323,
+        "t_stat": 6.9568690870489,
+        "decile_spread_bps": 0.020903148219683962,
+        "breakeven_cost_bps": 0.2481703014593356,
+        "theoretical_sharpe": 5.30218082648985
+      },
+      "50": {
+        "ic_pearson": 0.035196634431928296,
+        "ic_spearman": 0.02083167753011627,
+        "beta": 0.000027874581408836522,
+        "t_stat": 14.104980458775028,
+        "decile_spread_bps": 0.3417301201377969,
+
+// (truncated JSON preview: showing first 80 lines / 2689 chars)
+```
+
+// --- End File: data\reports\alpha_core_BTCUSDT.json ---
 
