@@ -1,0 +1,1196 @@
+--- File Tree Structure ---
+|-- buildalpha.go
+|-- data.go
+|-- sanity.go
+|-- shared.go
+|-- studyalpha.go
+
+// --- File: buildalpha.go ---
+
+```go
+package main
+
+import (
+	"bytes"
+	"compress/zlib"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+// Config
+const (
+	Year     = 2024
+	Month    = 1
+	StartDay = 1
+	EndDay   = 31
+	Warmup   = 5000
+	BaseDir  = "data"
+	Symbol   = "BTCUSDT"
+)
+
+// Precomputed Kernels
+var (
+	PropResKernel [2048]float64
+	CountPowLook  [256]float64
+	FragDecay     = math.Exp(-0.09)
+)
+
+func init() {
+	for k := 0; k < 2048; k++ {
+		PropResKernel[k] = 1.0 / math.Pow(float64(k+12), 0.41)
+	}
+	for c := 0; c < 256; c++ {
+		CountPowLook[c] = math.Min(math.Pow(float64(c), 0.63), 8.8)
+	}
+}
+
+func main() {
+	fmt.Printf("--- BUILDALPHA GO 2025 | %s %d-%02d ---\n", Symbol, Year, Month)
+
+	for d := StartDay; d <= EndDay; d++ {
+		res := processDay(d)
+		fmt.Println(res)
+	}
+}
+
+func processDay(day int) string {
+	idxPath := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", Year), fmt.Sprintf("%02d", Month), "index.quantdev")
+	dataPath := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", Year), fmt.Sprintf("%02d", Month), "data.quantdev")
+
+	offset, length := findBlob(idxPath, day)
+	if length == 0 {
+		return fmt.Sprintf("MISSING %d", day)
+	}
+
+	// Read Blob
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return fmt.Sprintf("ERR_IO %d", day)
+	}
+	defer f.Close()
+	f.Seek(int64(offset), 0)
+	compData := make([]byte, length)
+	f.Read(compData)
+
+	// Decompress
+	r, err := zlib.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		return fmt.Sprintf("ERR_ZLIB %d", day)
+	}
+	blob, err := io.ReadAll(r)
+	r.Close()
+
+	if len(blob) < HeaderSize {
+		return "ERR_HDR"
+	}
+
+	// Validate Header
+	rowCount := binary.LittleEndian.Uint64(blob[8:])
+	body := blob[HeaderSize:]
+
+	if uint64(len(body)) != rowCount*RowSize {
+		return "ERR_SIZE"
+	}
+
+	// Chunking
+	chunks := buildChunks(int(rowCount), CPUThreads)
+	results := make([][]byte, CPUThreads)
+	var wg sync.WaitGroup
+
+	for i := 0; i < CPUThreads; i++ {
+		wg.Add(1)
+		go func(idx int, start, end int) {
+			defer wg.Done()
+			results[idx] = processKernel(body, start, end, Warmup)
+		}(i, chunks[i][0], chunks[i][1])
+	}
+	wg.Wait()
+
+	// Merge
+	var outBuf bytes.Buffer
+	for _, res := range results {
+		outBuf.Write(res)
+	}
+
+	// Write
+	outDir := filepath.Join(BaseDir, "features", Symbol, fmt.Sprintf("%04d", Year), fmt.Sprintf("%02d", Month))
+	os.MkdirAll(outDir, 0755)
+	outPath := filepath.Join(outDir, fmt.Sprintf("%02d.bin", day))
+	os.WriteFile(outPath, outBuf.Bytes(), 0644)
+
+	return fmt.Sprintf("DONE %02d | %d rows", day, rowCount)
+}
+
+func buildChunks(total, n int) [][2]int {
+	res := make([][2]int, n)
+	base := total / n
+	rem := total % n
+	start := 0
+	for i := 0; i < n; i++ {
+		len := base
+		if i < rem {
+			len++
+		}
+		res[i] = [2]int{start, start + len}
+		start += len
+	}
+	return res
+}
+
+func findBlob(idxPath string, targetDay int) (uint64, uint64) {
+	f, err := os.Open(idxPath)
+	if err != nil {
+		return 0, 0
+	}
+	defer f.Close()
+
+	// Read Header
+	hdr := make([]byte, 16)
+	f.Read(hdr)
+	count := binary.LittleEndian.Uint64(hdr[8:])
+
+	row := make([]byte, 26) // v1 index row size
+	for i := uint64(0); i < count; i++ {
+		f.Read(row)
+		d := binary.LittleEndian.Uint16(row[0:])
+		if int(d) == targetDay {
+			off := binary.LittleEndian.Uint64(row[2:])
+			len := binary.LittleEndian.Uint64(row[10:])
+			return off, len
+		}
+	}
+	return 0, 0
+}
+
+// --- The Core Kernel (Optimized) ---
+
+func processKernel(data []byte, startRow, endRow, warmup int) []byte {
+	if startRow >= endRow {
+		return nil
+	}
+
+	actualStart := startRow - warmup
+	if actualStart < 0 {
+		actualStart = 0
+	}
+
+	// Pre-allocate output
+	validCount := endRow - startRow
+	out := make([]byte, validCount*FeatureSize)
+	outPos := 0
+
+	// State
+	stateGod := 0.0
+	stateFrag := 0.0
+	stateCntEma := 0.0
+	stateLamEma := 0.0
+	lamProp := 0.00005
+	cumDx := 0.0
+	cumFlow := 0.0
+	tradeCtr := 0
+	volClock := 0.0
+
+	bufS := make([]float64, 2048)
+	bufQ := make([]float64, 2048)
+	head := 0
+
+	prevTs := int64(0)
+	prevPx := 0.0
+
+	// Pre-calc scales
+	invPxScale := 1.0 / PxScale
+	invQtScale := 1.0 / QtScale
+
+	// Loop
+	offset := actualStart * RowSize
+	limit := endRow * RowSize
+
+	idx := actualStart
+
+	for offset < limit {
+		// Zero-copy read
+		// tid := binary.LittleEndian.Uint64(data[offset:])
+		pxRaw := binary.LittleEndian.Uint64(data[offset+8:])
+		qtyRaw := binary.LittleEndian.Uint64(data[offset+16:])
+		// fid := ...
+		cnt := binary.LittleEndian.Uint32(data[offset+32:])
+		flags := binary.LittleEndian.Uint16(data[offset+36:])
+		ts := int64(binary.LittleEndian.Uint64(data[offset+38:]))
+
+		offset += RowSize
+
+		// Math
+		px := float64(pxRaw) * invPxScale
+		qty := float64(qtyRaw) * invQtScale
+
+		cIdx := int(cnt)
+		if cIdx < 1 {
+			cIdx = 1
+		} else if cIdx > 255 {
+			cIdx = 255
+		}
+
+		sign := 1.0
+		if (flags & 1) != 0 {
+			sign = -1.0
+		}
+
+		dt := 0.0
+		if prevTs > 0 && ts > prevTs {
+			dt = float64(ts - prevTs)
+		}
+
+		ret := 0.0
+		if prevPx > 0 {
+			ret = math.Log(px / prevPx)
+		}
+		prevTs = ts
+		prevPx = px
+
+		// Vol Clock
+		volClock += qty
+		if volClock > 1.0 {
+			stateGod *= 0.5
+			stateFrag *= 0.5
+			volClock = 0.0
+		}
+
+		// Godflow
+		cPow := CountPowLook[cIdx]
+		gfIn := sign * qty * cPow
+		gfDecay := math.Exp(-0.0008 * dt)
+		stateGod = (stateGod * gfDecay) + gfIn
+
+		// Frag
+		gate := 1.0 / (1.0 + 12000.0*math.Abs(ret))
+		fsIn := math.Pow(float64(cIdx), 1.1) * qty * gate
+		stateFrag = (stateFrag * FragDecay) + fsIn
+
+		// PropRes
+		head = (head + 1) & 2047
+		bufS[head] = sign
+		bufQ[head] = qty
+
+		kProp := 0.0
+		for k := 0; k < 2000; k++ {
+			bIdx := (head - k) & 2047
+			kProp += bufS[bIdx] * bufQ[bIdx] * PropResKernel[k]
+		}
+
+		cumDx += math.Abs(px * ret)
+		cumFlow += math.Abs(sign * qty)
+		tradeCtr++
+
+		if tradeCtr >= 4000 {
+			if cumFlow > 1e-9 {
+				lamProp = 0.9*lamProp + 0.1*(cumDx/cumFlow)
+			}
+			cumDx = 0
+			cumFlow = 0
+			tradeCtr = 0
+		}
+		kProp = -lamProp * kProp
+
+		// CountSurge
+		surge := math.Max(float64(cIdx)-stateCntEma, 0.0)
+		kSurge := sign * math.Pow(qty, 0.77) * math.Pow(surge, 1.45)
+		stateCntEma = (float64(cIdx) * 0.002496) + (stateCntEma * 0.997504)
+
+		// Lambda
+		denom := math.Pow(qty, 0.84)
+		if denom < 1e-9 {
+			denom = 1.0
+		}
+		imp := math.Abs(ret) / denom
+		kLam := sign * qty * (imp - stateLamEma)
+		stateLamEma = (imp * 0.001665) + (stateLamEma * 0.998335)
+
+		// Output
+		if idx >= startRow {
+			finalSig := 0.31*stateGod + 0.26*(-stateFrag) + 0.20*kProp + 0.13*kSurge + 0.10*kLam
+
+			binary.LittleEndian.PutUint64(out[outPos:], uint64(ts))
+			binary.LittleEndian.PutUint64(out[outPos+8:], math.Float64bits(px))
+			binary.LittleEndian.PutUint64(out[outPos+16:], math.Float64bits(finalSig))
+			outPos += FeatureSize
+		}
+		idx++
+	}
+
+	return out
+}
+```
+
+// --- End File: buildalpha.go ---
+
+// --- File: data.go ---
+
+```go
+package main
+
+import (
+	"archive/zip"
+	"bytes"
+	"compress/zlib"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/binary"
+	"encoding/csv"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// Config
+const (
+	Symbol     = "BTCUSDT"
+	BaseDir    = "data"
+	FallbackDt = "2020-01-01"
+	HostData   = "data.binance.vision"
+	S3Prefix   = "data/futures/um"
+	DataSet    = "aggTrades"
+	RowsChunk  = 50_000
+)
+
+var (
+	httpClient *http.Client
+	stopEvent  bool
+	stopMu     sync.Mutex
+)
+
+func init() {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:    100,
+	}
+	httpClient = &http.Client{
+		Transport: tr,
+		Timeout:   10 * time.Second,
+	}
+}
+
+func main() {
+	// Signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		stopMu.Lock()
+		stopEvent = true
+		stopMu.Unlock()
+		fmt.Println("\nStopping...")
+	}()
+
+	fmt.Printf("--- data.go (Pure Go) | Symbol: %s ---\n", Symbol)
+
+	start, _ := time.Parse("2006-01-02", FallbackDt)
+	end := time.Now().UTC().AddDate(0, 0, -1)
+
+	if end.Before(start) {
+		fmt.Println("Nothing to do.")
+		return
+	}
+
+	// Generate day list
+	var days []time.Time
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		days = append(days, d)
+	}
+
+	fmt.Printf("[job] %d days -> %d threads.\n", len(days), CPUThreads)
+
+	// Worker Pool
+	jobs := make(chan time.Time, len(days))
+	results := make(chan string, len(days))
+	var wg sync.WaitGroup
+
+	for i := 0; i < CPUThreads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				stopMu.Lock()
+				if stopEvent {
+					stopMu.Unlock()
+					break
+				}
+				stopMu.Unlock()
+				results <- processDay(d)
+			}
+		}()
+	}
+
+	for _, d := range days {
+		jobs <- d
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	stats := make(map[string]int)
+	for r := range results {
+		stats[r]++
+	}
+	fmt.Printf("\n[done] Stats: %v\n", stats)
+}
+
+func processDay(d time.Time) string {
+	y, m, day := d.Year(), int(d.Month()), d.Day()
+
+	// Paths
+	dirPath := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", y), fmt.Sprintf("%02d", m))
+	idxPath := filepath.Join(dirPath, "index.quantdev")
+	dataPath := filepath.Join(dirPath, "data.quantdev")
+
+	// Check Index
+	if isIndexed(idxPath, dataPath, day) {
+		return "skip"
+	}
+
+	// Download
+	url := fmt.Sprintf("https://%s/%s/daily/%s/%s/%s-%s-%04d-%02d-%02d.zip",
+		HostData, S3Prefix, DataSet, Symbol, Symbol, DataSet, y, m, day)
+
+	zipBytes, err := download(url)
+	if err != nil {
+		if err == errNotFound {
+			return "missing"
+		}
+		return "error_dl"
+	}
+
+	// Parse & Encode
+	aggBlob, count, err := zipToAgg3(d, zipBytes)
+	if err != nil {
+		return "error_parse"
+	}
+	if count == 0 {
+		return "empty"
+	}
+
+	// Compress (Zlib)
+	var b bytes.Buffer
+	w := zlib.NewWriter(&b)
+	w.Write(aggBlob)
+	w.Close()
+	compBlob := b.Bytes()
+
+	// Checksum (SHA256)
+	sum := sha256.Sum256(aggBlob)
+	cSum := binary.LittleEndian.Uint64(sum[:8]) // Use first 8 bytes of SHA256
+
+	// Write (Locking handled by OS append usually, but let's be safe per file if needed.
+	// Since we partition by day, race conditions only happen if multiple threads hit same month.
+	// For simplicity in this port, we rely on atomic appends or create dir first.
+	os.MkdirAll(dirPath, 0755)
+
+	// Append Data
+	fData, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return "error_io"
+	}
+	defer fData.Close()
+
+	stat, _ := fData.Stat()
+	offset := stat.Size()
+
+	if _, err := fData.Write(compBlob); err != nil {
+		return "error_write"
+	}
+
+	// Append Index
+	fIdx, err := os.OpenFile(idxPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return "error_idx"
+	}
+	defer fIdx.Close()
+
+	idxStat, _ := fIdx.Stat()
+	if idxStat.Size() == 0 {
+		// Init Header
+		hdr := make([]byte, 16)
+		copy(hdr[0:], IdxMagic)
+		binary.LittleEndian.PutUint32(hdr[4:], uint32(IdxVersion))
+		binary.LittleEndian.PutUint64(hdr[8:], 0) // count
+		fIdx.Write(hdr)
+	}
+
+	// Write Row: Day(2), Offset(8), Length(8), Checksum(8)
+	row := make([]byte, 26)
+	binary.LittleEndian.PutUint16(row[0:], uint16(day))
+	binary.LittleEndian.PutUint64(row[2:], uint64(offset))
+	binary.LittleEndian.PutUint64(row[10:], uint64(len(compBlob)))
+	binary.LittleEndian.PutUint64(row[18:], cSum)
+
+	if _, err := fIdx.Seek(0, io.SeekEnd); err != nil {
+		return "error_idx"
+	}
+	if _, err := fIdx.Write(row); err != nil {
+		return "error_idx"
+	}
+
+	// Update Count
+	fIdx.Seek(8, io.SeekStart)
+	var currentCount uint64
+	binary.Read(fIdx, binary.LittleEndian, &currentCount)
+	fIdx.Seek(8, io.SeekStart)
+	binary.Write(fIdx, binary.LittleEndian, currentCount+1)
+
+	return "ok"
+}
+
+var errNotFound = fmt.Errorf("404")
+
+func download(url string) ([]byte, error) {
+	for i := 0; i < 5; i++ {
+		resp, err := httpClient.Get(url)
+		if err == nil {
+			if resp.StatusCode == 200 {
+				defer resp.Body.Close()
+				return io.ReadAll(resp.Body)
+			}
+			resp.Body.Close()
+			if resp.StatusCode == 404 {
+				return nil, errNotFound
+			}
+		}
+		time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("timeout")
+}
+
+func zipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
+	r, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	for _, f := range r.File {
+		if !strings.HasSuffix(f.Name, ".csv") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		defer rc.Close()
+
+		csvR := csv.NewReader(rc)
+		headers, err := csvR.Read()
+		if err != nil {
+			return nil, 0, err
+		}
+
+		// Map headers
+		idxMap := make(map[string]int)
+		for i, h := range headers {
+			idxMap[strings.ToLower(strings.TrimSpace(strings.ReplaceAll(h, "_", "")))] = i
+		}
+
+		get := func(row []string, key string, def int) string {
+			if i, ok := idxMap[key]; ok && i < len(row) {
+				return row[i]
+			}
+			// fallback
+			if def < len(row) {
+				return row[def]
+			}
+			return ""
+		}
+
+		var rows []byte
+		var count uint64
+		var minTs, maxTs int64 = math.MaxInt64, math.MinInt64
+		rowBuf := make([]byte, RowSize)
+
+		for {
+			rec, err := csvR.Read()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				continue
+			}
+
+			// Parse
+			ts, _ := strconv.ParseInt(get(rec, "transacttime", 5), 10, 64)
+			tid, _ := strconv.ParseUint(get(rec, "aggtradeid", 0), 10, 64)
+			pxF, _ := strconv.ParseFloat(get(rec, "price", 1), 64)
+			qtyF, _ := strconv.ParseFloat(get(rec, "quantity", 2), 64)
+			fi, _ := strconv.ParseUint(get(rec, "firsttradeid", 3), 10, 64)
+			li, _ := strconv.ParseUint(get(rec, "lasttradeid", 4), 10, 64)
+			isMakerStr := get(rec, "isbuyermaker", 6)
+			isMaker := isMakerStr == "true" || isMakerStr == "True" || isMakerStr == "1"
+
+			cnt := uint32(li - fi + 1)
+			px := uint64(pxF * PxScale)
+			qty := uint64(qtyF * QtScale)
+			flags := uint16(0)
+			if isMaker {
+				flags = 1
+			}
+
+			if ts < minTs {
+				minTs = ts
+			}
+			if ts > maxTs {
+				maxTs = ts
+			}
+
+			PutRow(rowBuf, tid, px, qty, fi, cnt, flags, ts)
+			rows = append(rows, rowBuf...)
+			count++
+		}
+
+		if count == 0 {
+			return nil, 0, nil
+		}
+
+		// Header
+		hdr := make([]byte, HeaderSize)
+		copy(hdr[0:], AggMagic)
+		hdr[4] = 1
+		hdr[5] = uint8(t.Day())
+		binary.LittleEndian.PutUint16(hdr[6:], 3) // zlvl
+		binary.LittleEndian.PutUint64(hdr[8:], count)
+		binary.LittleEndian.PutUint64(hdr[16:], uint64(minTs))
+		binary.LittleEndian.PutUint64(hdr[24:], uint64(maxTs))
+
+		return append(hdr, rows...), count, nil
+	}
+	return nil, 0, fmt.Errorf("no csv")
+}
+
+func isIndexed(idxPath, dataPath string, day int) bool {
+	f, err := os.Open(idxPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	// Check Header
+	hdr := make([]byte, 16)
+	if _, err := f.Read(hdr); err != nil {
+		return false
+	}
+	if string(hdr[:4]) != IdxMagic {
+		return false
+	}
+	count := binary.LittleEndian.Uint64(hdr[8:])
+
+	// Scan rows (26 bytes each)
+	row := make([]byte, 26)
+	for i := uint64(0); i < count; i++ {
+		if _, err := f.Read(row); err != nil {
+			break
+		}
+		d := binary.LittleEndian.Uint16(row[0:])
+		if int(d) == day {
+			return true
+		}
+	}
+	return false
+}
+```
+
+// --- End File: data.go ---
+
+// --- File: sanity.go ---
+
+```go
+package main
+
+import (
+	"bytes"
+	"compress/zlib"
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+)
+
+const Symbol = "BTCUSDT"
+
+func main() {
+	root := filepath.Join("data", Symbol)
+	dirs, _ := os.ReadDir(root)
+
+	var tasks []string
+	for _, y := range dirs {
+		if y.IsDir() {
+			months, _ := os.ReadDir(filepath.Join(root, y.Name()))
+			for _, m := range months {
+				if m.IsDir() {
+					tasks = append(tasks, filepath.Join(root, y.Name(), m.Name()))
+				}
+			}
+		}
+	}
+
+	fmt.Printf("SANITY CHECK: %s (%d months)\n", Symbol, len(tasks))
+
+	var wg sync.WaitGroup
+	jobs := make(chan string, len(tasks))
+
+	for i := 0; i < CPUThreads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				validateMonth(path)
+			}
+		}()
+	}
+
+	for _, t := range tasks {
+		jobs <- t
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func validateMonth(dir string) {
+	idxPath := filepath.Join(dir, "index.quantdev")
+	dataPath := filepath.Join(dir, "data.quantdev")
+
+	fIdx, err := os.Open(idxPath)
+	if err != nil {
+		fmt.Printf("FAIL: %s (No Index)\n", dir)
+		return
+	}
+	defer fIdx.Close()
+
+	fData, err := os.Open(dataPath)
+	if err != nil {
+		fmt.Printf("FAIL: %s (No Data)\n", dir)
+		return
+	}
+	defer fData.Close()
+
+	// Read Index Header
+	hdr := make([]byte, 16)
+	fIdx.Read(hdr)
+	count := binary.LittleEndian.Uint64(hdr[8:])
+
+	row := make([]byte, 26)
+	issues := 0
+
+	for i := uint64(0); i < count; i++ {
+		fIdx.Read(row)
+		offset := int64(binary.LittleEndian.Uint64(row[2:]))
+		length := int(binary.LittleEndian.Uint64(row[10:]))
+		expSum := binary.LittleEndian.Uint64(row[18:])
+
+		compData := make([]byte, length)
+		fData.Seek(offset, 0)
+		fData.Read(compData)
+
+		// Decompress
+		r, err := zlib.NewReader(bytes.NewReader(compData))
+		if err != nil {
+			issues++
+			continue
+		}
+		aggBlob, _ := io.ReadAll(r)
+		r.Close()
+
+		// Checksum
+		s := sha256.Sum256(aggBlob)
+		actSum := binary.LittleEndian.Uint64(s[:8])
+		if actSum != expSum {
+			issues++
+			continue
+		}
+
+		// Header Check
+		if len(aggBlob) < HeaderSize {
+			issues++
+			continue
+		}
+		rowCount := binary.LittleEndian.Uint64(aggBlob[8:])
+		if uint64(len(aggBlob)) != HeaderSize+rowCount*RowSize {
+			issues++
+		}
+	}
+
+	if issues > 0 {
+		fmt.Printf("ISSUES: %s (%d errors)\n", dir, issues)
+	} else {
+		// fmt.Printf("OK: %s\n", dir)
+	}
+}
+```
+
+// --- End File: sanity.go ---
+
+// --- File: shared.go ---
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"math"
+	"sort"
+)
+
+// --- Constants ---
+const (
+	CPUThreads = 24
+	PxScale    = 100_000_000.0
+	QtScale    = 100_000_000.0
+	AggMagic   = "AGG3"
+	IdxMagic   = "QIDX"
+	IdxVersion = 1
+)
+
+// --- Structs (Binary Layouts) ---
+
+// AGG3 Header: magic(4), ver(1), day(1), zlvl(2), count(8), min_ts(8), max_ts(8), pad(16)
+// Total: 48 bytes
+const HeaderSize = 48
+
+type AggHeader struct {
+	Magic    [4]byte
+	Version  uint8
+	Day      uint8
+	ZLevel   uint16
+	RowCount uint64
+	MinTs    int64
+	MaxTs    int64
+	Padding  [16]byte
+}
+
+// AGG3 Row: 48 bytes
+// trade_id(8), px(8), qty(8), first_id(8), count(4), flags(2), ts(8), pad(2)
+const RowSize = 48
+
+// Feature Row: 24 bytes
+// ts(8), price(8), signal(8)
+const FeatureSize = 24
+
+// --- Math Helpers ---
+
+func Mean(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0.0
+	}
+	sum := 0.0
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
+}
+
+func StdDev(vals []float64, mean float64) float64 {
+	if len(vals) < 2 {
+		return 0.0
+	}
+	sumSq := 0.0
+	for _, v := range vals {
+		d := v - mean
+		sumSq += d * d
+	}
+	return math.Sqrt(sumSq / float64(len(vals)-1))
+}
+
+func Correlation(x, y []float64) float64 {
+	n := len(x)
+	if n != len(y) || n == 0 {
+		return 0.0
+	}
+	mx, my := Mean(x), Mean(y)
+	sxx, syy, sxy := 0.0, 0.0, 0.0
+	for i := 0; i < n; i++ {
+		dx := x[i] - mx
+		dy := y[i] - my
+		sxx += dx * dx
+		syy += dy * dy
+		sxy += dx * dy
+	}
+	if sxx == 0 || syy == 0 {
+		return 0.0
+	}
+	return sxy / math.Sqrt(sxx*syy)
+}
+
+func Percentile(sorted []float64, p float64) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0.0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 100 {
+		return sorted[n-1]
+	}
+	k := (p / 100.0) * float64(n-1)
+	f := math.Floor(k)
+	c := math.Ceil(k)
+	if f == c {
+		return sorted[int(k)]
+	}
+	d0 := sorted[int(f)] * (c - k)
+	d1 := sorted[int(c)] * (k - f)
+	return d0 + d1
+}
+
+// RankData implements rankdata (average rank for ties)
+func RankData(vals []float64) []float64 {
+	n := len(vals)
+	type Item struct {
+		Val float64
+		Idx int
+	}
+	items := make([]Item, n)
+	for i, v := range vals {
+		items[i] = Item{v, i}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Val < items[j].Val
+	})
+
+	ranks := make([]float64, n)
+	i := 0
+	for i < n {
+		j := i + 1
+		for j < n && items[j].Val == items[i].Val {
+			j++
+		}
+		// Span is [i, j)
+		count := float64(j - i)
+		// Average rank = (sum of positions) / count
+		// positions are i+1, i+2, ..., i+count
+		// sum = (count/2) * (2*(i+1) + (count-1))
+		avgRank := float64(i+1) + (count-1.0)/2.0
+
+		for k := i; k < j; k++ {
+			ranks[items[k].Idx] = avgRank
+		}
+		i = j
+	}
+	return ranks
+}
+
+// --- Binary Helpers (High Performance) ---
+
+func PutRow(buf []byte, tid, px, qty, fid uint64, cnt uint32, flags uint16, ts int64) {
+	binary.LittleEndian.PutUint64(buf[0:], tid)
+	binary.LittleEndian.PutUint64(buf[8:], px)
+	binary.LittleEndian.PutUint64(buf[16:], qty)
+	binary.LittleEndian.PutUint64(buf[24:], fid)
+	binary.LittleEndian.PutUint32(buf[32:], cnt)
+	binary.LittleEndian.PutUint16(buf[36:], flags)
+	binary.LittleEndian.PutUint64(buf[38:], uint64(ts))
+	// Padding 2 bytes at 46 left zero
+}
+
+func ReadRow(buf []byte) (tid, px, qty, fid uint64, cnt uint32, flags uint16, ts int64) {
+	_ = buf[47] // Bounds check hint
+	tid = binary.LittleEndian.Uint64(buf[0:])
+	px = binary.LittleEndian.Uint64(buf[8:])
+	qty = binary.LittleEndian.Uint64(buf[16:])
+	fid = binary.LittleEndian.Uint64(buf[24:])
+	cnt = binary.LittleEndian.Uint32(buf[32:])
+	flags = binary.LittleEndian.Uint16(buf[36:])
+	ts = int64(binary.LittleEndian.Uint64(buf[38:]))
+	return
+}
+```
+
+// --- End File: shared.go ---
+
+// --- File: studyalpha.go ---
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+)
+
+// Config matches Python
+const (
+	Year    = 2024
+	Month   = 1
+	BaseDir = "data"
+	Symbol  = "BTCUSDT"
+)
+
+var Horizons = []int{20, 50, 100, 200}
+
+func main() {
+	featDir := filepath.Join(BaseDir, "features", Symbol, fmt.Sprintf("%04d", Year), fmt.Sprintf("%02d", Month))
+	files, _ := os.ReadDir(featDir)
+
+	type Job struct {
+		Path string
+		Name string
+	}
+	jobs := make(chan Job, len(files))
+	for _, f := range files {
+		if filepath.Ext(f.Name()) == ".bin" {
+			jobs <- Job{filepath.Join(featDir, f.Name()), f.Name()}
+		}
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	results := make(chan DayResult, len(files))
+
+	for i := 0; i < CPUThreads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				results <- analyzeDay(j.Path, j.Name)
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	// Aggregate
+	var allRes []DayResult
+	for r := range results {
+		allRes = append(allRes, r)
+	}
+	sort.Slice(allRes, func(i, j int) bool { return allRes[i].Name < allRes[j].Name })
+
+	// Report
+	report := GlobalReport{
+		Symbol:   Symbol,
+		Year:     Year,
+		Month:    Month,
+		Horizons: Horizons,
+		Days:     make(map[string]DayResult),
+	}
+
+	fmt.Printf("%-5s | %10s | %8s | %8s\n", "DAY", "TICKS", "IC(20)", "SHARPE")
+	fmt.Println("----------------------------------------")
+
+	for _, r := range allRes {
+		report.Days[r.Name] = r
+		ic := 0.0
+		if v, ok := r.ICTerm["20"]; ok {
+			ic = v
+		}
+		fmt.Printf("%-5s | %10d | %8.4f | %8.2f\n", r.Name, r.Ticks, ic, r.Sharpe)
+	}
+
+	outPath := filepath.Join(BaseDir, "reports", "alpha_summary.json")
+	os.MkdirAll(filepath.Dir(outPath), 0755)
+	f, _ := os.Create(outPath)
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	enc.Encode(report)
+	f.Close()
+	fmt.Println("\nJSON Written to", outPath)
+}
+
+type DayResult struct {
+	Name   string
+	Ticks  int
+	ICTerm map[string]float64
+	Sharpe float64
+}
+
+type GlobalReport struct {
+	Symbol   string
+	Year     int
+	Month    int
+	Horizons []int
+	Days     map[string]DayResult
+}
+
+func analyzeDay(path, name string) DayResult {
+	data, _ := os.ReadFile(path)
+	n := len(data) / FeatureSize
+
+	ts := make([]int64, n)
+	px := make([]float64, n)
+	sig := make([]float64, n)
+
+	for i := 0; i < n; i++ {
+		off := i * FeatureSize
+		ts[i] = int64(binary.LittleEndian.Uint64(data[off:]))
+		px[i] = math.Float64frombits(binary.LittleEndian.Uint64(data[off+8:]))
+		sig[i] = math.Float64frombits(binary.LittleEndian.Uint64(data[off+16:]))
+	}
+
+	res := DayResult{Name: name, Ticks: n, ICTerm: make(map[string]float64)}
+
+	if n < 500 {
+		return res
+	}
+
+	// Calc ICs
+	for _, h := range Horizons {
+		if n <= h {
+			continue
+		}
+		var s, r []float64
+		for i := 0; i < n-h; i++ {
+			p0 := px[i]
+			p1 := px[i+h]
+			if p0 > 0 {
+				ret := (p1 - p0) / p0
+				s = append(s, sig[i])
+				r = append(r, ret)
+			}
+		}
+		res.ICTerm[fmt.Sprintf("%d", h)] = Correlation(s, r)
+	}
+
+	// Strategy (Horizon 20)
+	h := 20
+	var pnl []float64
+	for i := 0; i < n-h; i++ {
+		p0 := px[i]
+		p1 := px[i+h]
+		if p0 > 0 && sig[i] != 0 {
+			ret := (p1 - p0) / p0
+			pnl = append(pnl, sig[i]*ret)
+		}
+	}
+
+	if len(pnl) > 1 {
+		mu := Mean(pnl)
+		std := StdDev(pnl, mu)
+		if std > 1e-9 {
+			scale := math.Sqrt(365 * 24 * 60 * 6) // annualize
+			res.Sharpe = (mu / std) * scale
+		}
+	}
+
+	return res
+}
+```
+
+// --- End File: studyalpha.go ---
+

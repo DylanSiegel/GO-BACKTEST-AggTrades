@@ -1,0 +1,8 @@
+### System Specifications
+
+  * **OS**: Windows 11
+  * **GO LANG**: go version go1.25.4 windows/amd64
+  * **CUDA**: 13.0
+  * **CPU**: AMD Ryzen 9 7900X (12 Cores, 24 Logical Processors)
+  * **GPU**: NVIDIA RTX 5070 Ti (16 GB VRAM)
+  * **RAM**: 32 GB DDR5 
