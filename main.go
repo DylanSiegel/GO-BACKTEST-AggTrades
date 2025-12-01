@@ -9,7 +9,6 @@ import (
 
 func main() {
 	// Hardware Optimization: Ryzen 9 7900X
-	// Force the Go runtime to schedule goroutines across all logical threads.
 	runtime.GOMAXPROCS(CPUThreads)
 
 	if len(os.Args) < 2 {
@@ -22,15 +21,13 @@ func main() {
 
 	switch cmd {
 	case "data":
-		runData() // Download + compress Binance data
-	case "ofi":
-		runOFI() // Mass-test OFI core directional variants
-	case "sum":
-		runSum() // Summarize OFI reports
+		runData() // Download
+	case "build":
+		runBuild() // Run Models -> .bin
+	case "study":
+		runStudy() // IS/OOS Stats
 	case "sanity":
-		runSanity() // Verify file integrity
-	case "oos":
-		runOOS() // IS/OOS comparison for OFI variants
+		runSanity() // Integrity Check
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 		printHelp()
@@ -42,13 +39,10 @@ func main() {
 
 func printHelp() {
 	fmt.Println("Usage: quant.exe [command]")
-	fmt.Println("--- DATA PIPELINE ---")
-	fmt.Println("  data    - Download & compress raw aggTrades")
-	fmt.Println("--- ALPHA LAB ---")
-	fmt.Println("  ofi     - Test OFI core directional variants (15ms lag)")
-	fmt.Println("  sum     - Summarize OFI metrics (variant ranking)")
-	fmt.Println("--- AUDIT ---")
-	fmt.Println("  sanity  - Verify data/index integrity")
+	fmt.Println("  data   - Download raw aggTrades")
+	fmt.Println("  build  - Run Hawkes/Adaptive/EMA models -> features")
+	fmt.Println("  study  - Run IS/OOS backtest on features")
+	fmt.Println("  sanity - Check data integrity")
 }
 
 func getMemUsage() string {

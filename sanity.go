@@ -146,7 +146,7 @@ func validateMonth(dir string) {
 			continue
 		}
 
-		// Validate header magic and version minimally
+		// Validate header magic
 		if string(aggBlob[:4]) != AggMagic {
 			issues++
 			continue

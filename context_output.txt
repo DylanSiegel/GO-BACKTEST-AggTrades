@@ -1,35 +1,12 @@
-[{
-	"resource": "/Z:/Benchmarks/OOS.go",
-	"owner": "_generated_diagnostic_collection_name_#7",
-	"code": {
-		"value": "default",
-		"target": {
-			"$mid": 1,
-			"path": "/golang.org/x/tools/go/analysis/passes/printf",
-			"scheme": "https",
-			"authority": "pkg.go.dev"
-		}
-	},
-	"severity": 4,
-	"message": "fmt.Fprintf format %s reads arg #19, but call has 18 args",
-	"source": "printf",
-	"startLineNumber": 220,
-	"startColumn": 110,
-	"endLineNumber": 220,
-	"endColumn": 112,
-	"origin": "extHost1"
-}]
-
 --- File Tree Structure ---
 |-- data/
-|-- OOS.go
 |-- common.go
 |-- data.go
 |-- main.go
 |-- metrics.go
-|-- ofi.go
+|-- ofibuild.go
+|-- ofistudy.go
 |-- sanity.go
-|-- sum.go
     |-- BTCUSDT/
         |-- 2020/
         |-- 2021/
@@ -44,271 +21,6 @@
             |-- [01..12]/ (12 month dirs)
             |-- [01..11]/ (11 month dirs)
 
-// --- File: OOS.go ---
-
-```go
-package main
-
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
-	"text/tabwriter"
-	"time"
-)
-
-// OOSStartDate defines the boundary between IS and OOS.
-// All days < OOSStartDate are IS; >= OOSStartDate are OOS.
-const OOSStartDate = "2024-01-01"
-
-// ofiOOSAgg aggregates IS/OOS stats per variant.
-type ofiOOSAgg struct {
-	Variant string
-
-	ISDays   int
-	OOSDays  int
-	ISBars   int64
-	OOSBars  int64
-	StartIS  string
-	EndIS    string
-	StartOOS string
-	EndOOS   string
-
-	IS_SumIC      float64
-	OOS_SumIC     float64
-	IS_SumHAC     float64
-	OOS_SumHAC    float64
-	IS_SumSR      float64
-	OOS_SumSR     float64
-	IS_SumProbSR  float64
-	OOS_SumProbSR float64
-	IS_SumBE      float64
-	OOS_SumBE     float64
-	IS_SumHit     float64
-	OOS_SumHit    float64
-	IS_SumFill    float64
-	OOS_SumFill   float64
-}
-
-// runOOS reads the full OFI metrics report and produces a strict
-// IS vs OOS comparison per variant at the configured TargetHz.
-func runOOS() {
-	// Parse OOS boundary once
-	oosBoundary, err := time.Parse("2006-01-02", OOSStartDate)
-	if err != nil {
-		fmt.Printf("Invalid OOSStartDate const: %v\n", err)
-		return
-	}
-
-	path := filepath.FromSlash(OFIReportPath)
-	f, err := os.Open(path)
-	if err != nil {
-		fmt.Printf("Error opening OFI report: %v\n", err)
-		return
-	}
-	defer f.Close()
-
-	startT := time.Now()
-
-	var entries []AlphaMetrics
-	dec := json.NewDecoder(f)
-	if err := dec.Decode(&entries); err != nil {
-		fmt.Printf("Error decoding OFI report JSON: %v\n", err)
-		return
-	}
-	if len(entries) == 0 {
-		fmt.Println("No OFI metrics found.")
-		return
-	}
-
-	aggMap := make(map[string]*ofiOOSAgg)
-
-	for _, e := range entries {
-		// label format: "SYMBOL|VARIANT|YYYY-MM-DD"
-		parts := strings.Split(e.Label, "|")
-		if len(parts) < 3 {
-			continue
-		}
-		variant := parts[1]
-		dateStr := parts[2]
-
-		// parse date
-		dayT, err := time.Parse("2006-01-02", dateStr)
-		if err != nil {
-			continue
-		}
-		h, ok := e.Horizon[TargetHz]
-		if !ok {
-			continue
-		}
-
-		a, ok := aggMap[variant]
-		if !ok {
-			a = &ofiOOSAgg{Variant: variant}
-			aggMap[variant] = a
-		}
-
-		isOOS := !dayT.Before(oosBoundary)
-
-		if isOOS {
-			a.OOSDays++
-			a.OOSBars += int64(e.NBars)
-
-			if a.StartOOS == "" || dateStr < a.StartOOS {
-				a.StartOOS = dateStr
-			}
-			if a.EndOOS == "" || dateStr > a.EndOOS {
-				a.EndOOS = dateStr
-			}
-
-			a.OOS_SumIC += h.ICPearson
-			a.OOS_SumHAC += h.HACSharpe
-			a.OOS_SumSR += h.TheoreticalSharpe
-			a.OOS_SumProbSR += h.ProbSharpeRatio
-			a.OOS_SumBE += h.BreakevenBps
-			a.OOS_SumHit += h.DirectionalHit
-			a.OOS_SumFill += h.FillRate
-		} else {
-			a.ISDays++
-			a.ISBars += int64(e.NBars)
-
-			if a.StartIS == "" || dateStr < a.StartIS {
-				a.StartIS = dateStr
-			}
-			if a.EndIS == "" || dateStr > a.EndIS {
-				a.EndIS = dateStr
-			}
-
-			a.IS_SumIC += h.ICPearson
-			a.IS_SumHAC += h.HACSharpe
-			a.IS_SumSR += h.TheoreticalSharpe
-			a.IS_SumProbSR += h.ProbSharpeRatio
-			a.IS_SumBE += h.BreakevenBps
-			a.IS_SumHit += h.DirectionalHit
-			a.IS_SumFill += h.FillRate
-		}
-	}
-
-	if len(aggMap) == 0 {
-		fmt.Println("No valid OFI metrics at target horizon for IS/OOS.")
-		return
-	}
-
-	// Flatten and sort by OOS mean HAC Sharpe descending
-	var aggs []*ofiOOSAgg
-	for _, a := range aggMap {
-		// Only keep variants that have at least some OOS coverage
-		if a.OOSDays > 0 {
-			aggs = append(aggs, a)
-		}
-	}
-	if len(aggs) == 0 {
-		fmt.Println("No variants have out-of-sample days after OOSStartDate.")
-		return
-	}
-
-	sort.Slice(aggs, func(i, j int) bool {
-		di := float64(aggs[i].OOSDays)
-		dj := float64(aggs[j].OOSDays)
-		if di == 0 || dj == 0 {
-			return aggs[i].Variant < aggs[j].Variant
-		}
-		return (aggs[i].OOS_SumHAC / di) > (aggs[j].OOS_SumHAC / dj)
-	})
-
-	// Print summary
-	fmt.Printf("\n--- OFI IS/OOS SUMMARY | %s | Horizon: %s ticks ---\n",
-		filepath.Base(path), TargetHz)
-	fmt.Printf("OOS boundary: %s (IS: < %s, OOS: >= %s)\n", OOSStartDate, OOSStartDate, OOSStartDate)
-	fmt.Printf("Processing Time: %s\n\n", time.Since(startT))
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-
-	// Header
-	fmt.Fprintf(w, "VARIANT\tIS_DAYS\tOOS_DAYS\tIS_HAC\tOOS_HAC\tOOS/IS\tIS_IC\tOOS_IC\tIS_ProbSR\tOOS_ProbSR\tIS_BE_BPS\tOOS_BE_BPS\tIS_HIT\tOOS_HIT\tIS_FILL\tOOS_FILL\tIS_PERIOD\tOOS_PERIOD\n")
-	fmt.Fprintf(w, "-------\t-------\t--------\t------\t-------\t------\t-----\t------\t---------\t----------\t----------\t-----------\t------\t-------\t-------\t--------\t---------\t----------\n")
-
-	for _, a := range aggs {
-		isN := float64(a.ISDays)
-		oosN := float64(a.OOSDays)
-
-		var (
-			isHAC, oosHAC, ratio float64
-			isIC, oosIC          float64
-			isProb, oosProb      float64
-			isBE, oosBE          float64
-			isHit, oosHit        float64
-			isFill, oosFill      float64
-		)
-
-		if isN > 0 {
-			isHAC = a.IS_SumHAC / isN
-			isIC = a.IS_SumIC / isN
-			isProb = a.IS_SumProbSR / isN
-			isBE = a.IS_SumBE / isN
-			isHit = (a.IS_SumHit / isN) * 100.0
-			isFill = (a.IS_SumFill / isN) * 100.0
-		}
-		if oosN > 0 {
-			oosHAC = a.OOS_SumHAC / oosN
-			oosIC = a.OOS_SumIC / oosN
-			oosProb = a.OOS_SumProbSR / oosN
-			oosBE = a.OOS_SumBE / oosN
-			oosHit = (a.OOS_SumHit / oosN) * 100.0
-			oosFill = (a.OOS_SumFill / oosN) * 100.0
-		}
-		if isHAC != 0 {
-			ratio = oosHAC / isHAC
-		}
-
-		fmt.Fprintf(
-			w,
-			"%s\t%d\t%d\t%.2f\t%.2f\t%.2f\t%.4f\t%.4f\t%.2f\t%.2f\t%.2f\t%.2f\t%.1f%%\t%.1f%%\t%.1f%%\t%.1f%%\t%s→%s\t%s→%s\n",
-			a.Variant,
-			a.ISDays,
-			a.OOSDays,
-			isHAC,
-			oosHAC,
-			ratio,
-			isIC,
-			oosIC,
-			isProb,
-			oosProb,
-			isBE,
-			oosBE,
-			isHit,
-			oosHit,
-			isFill,
-			oosFill,
-			safePeriod(a.StartIS, a.EndIS),
-			safePeriod(a.StartOOS, a.EndOOS),
-		)
-	}
-
-	w.Flush()
-	fmt.Println("")
-}
-
-// safePeriod formats "start→end" for date ranges, handling empty strings.
-func safePeriod(start, end string) string {
-	if start == "" && end == "" {
-		return ""
-	}
-	if start == "" {
-		return end
-	}
-	if end == "" {
-		return start
-	}
-	return start + "→" + end
-}
-```
-
-// --- End File: OOS.go ---
-
 // --- File: common.go ---
 
 ```go
@@ -316,115 +28,64 @@ package main
 
 import (
 	"encoding/binary"
-	"math"
 )
 
 // --- Shared Configuration ---
 const (
-	// Hardware Optimization: Ryzen 9 7900X (12 Cores / 24 Threads)
-	// We saturate all logical cores for parallel workloads.
 	CPUThreads = 24
+	Symbol     = "BTCUSDT"
+	BaseDir    = "data"
 
-	Symbol  = "BTCUSDT"
-	BaseDir = "data"
+	// Binary Layout
+	PxScale    = 100_000_000.0
+	QtScale    = 100_000_000.0
+	HeaderSize = 48
+	RowSize    = 48
 
-	// Default Targets
-	TargetYear  = 2024
-	TargetMonth = 1
-
-	// Binary Format Constants
-	// Floating point scalar for integer compression (1.00 = 100000000)
-	PxScale = 100_000_000.0
-	QtScale = 100_000_000.0
-
-	// Magic headers for file identification
+	// Magic Headers
 	AggMagic   = "AGG3"
 	IdxMagic   = "QIDX"
-	IdxVersion = 1
-
-	// Binary Layout Sizes (Bytes)
-	HeaderSize  = 48
-	RowSize     = 48
-	FeatureSize = 24
+	IdxVersion = 1 // Index file format version
 )
 
-// --- Binary Structures ---
+// --- Zero-Alloc Trade Parsing ---
 
-// AggHeader matches the binary layout for our compressed data files.
-// Used by data.go for writing and build.go for reading.
-type AggHeader struct {
-	Magic    [4]byte
-	Version  uint8
-	Day      uint8
-	ZLevel   uint16
-	RowCount uint64
-	MinTs    int64
-	MaxTs    int64
-	Padding  [16]byte
+type AggRow struct {
+	TsMs       int64
+	PriceFixed uint64
+	QtyFixed   uint64
+	Flags      uint16
 }
 
-// --- Math Helpers ---
-// Highly optimized, inlined-capable math functions used across the monolith.
-
-// Mean calculates the arithmetic average of a slice.
-func Mean(vals []float64) float64 {
-	if len(vals) == 0 {
-		return 0.0
+// ParseAggRow interprets a 48-byte row from data.quantdev without allocation.
+func ParseAggRow(row []byte) AggRow {
+	return AggRow{
+		TsMs:       int64(binary.LittleEndian.Uint64(row[38:])),
+		PriceFixed: binary.LittleEndian.Uint64(row[8:]),
+		QtyFixed:   binary.LittleEndian.Uint64(row[16:]),
+		Flags:      binary.LittleEndian.Uint16(row[36:]),
 	}
-	sum := 0.0
-	for _, v := range vals {
-		sum += v
-	}
-	return sum / float64(len(vals))
 }
 
-// StdDev calculates sample standard deviation.
-// Requires pre-calculated mean to avoid redundant iteration in tight loops.
-func StdDev(vals []float64, mean float64) float64 {
-	if len(vals) < 2 {
-		return 0.0
-	}
-	sumSq := 0.0
-	for _, v := range vals {
-		d := v - mean
-		sumSq += d * d
-	}
-	return math.Sqrt(sumSq / float64(len(vals)-1))
+func TradePrice(row AggRow) float64 {
+	return float64(row.PriceFixed) / PxScale
 }
 
-// Correlation calculates Pearson correlation coefficient (r).
-func Correlation(x, y []float64) float64 {
-	n := len(x)
-	if n != len(y) || n == 0 {
-		return 0.0
-	}
-	mx, my := Mean(x), Mean(y)
-	sxx, syy, sxy := 0.0, 0.0, 0.0
-	for i := 0; i < n; i++ {
-		dx := x[i] - mx
-		dy := y[i] - my
-		sxx += dx * dx
-		syy += dy * dy
-		sxy += dx * dy
-	}
-	if sxx == 0 || syy == 0 {
-		return 0.0
-	}
-	return sxy / math.Sqrt(sxx*syy)
+func TradeQty(row AggRow) float64 {
+	return float64(row.QtyFixed) / QtScale
 }
 
-// --- Binary Helpers ---
+func TradeDollar(row AggRow) float64 {
+	return TradePrice(row) * TradeQty(row)
+}
 
-// PutRow efficiently packs standard AggTrade data into a byte slice.
-// Uses LittleEndian to match x86_64 architecture (Ryzen 7900X) natively.
-func PutRow(buf []byte, tid, px, qty, fid uint64, cnt uint32, flags uint16, ts int64) {
-	binary.LittleEndian.PutUint64(buf[0:], tid)
-	binary.LittleEndian.PutUint64(buf[8:], px)
-	binary.LittleEndian.PutUint64(buf[16:], qty)
-	binary.LittleEndian.PutUint64(buf[24:], fid)
-	binary.LittleEndian.PutUint32(buf[32:], cnt)
-	binary.LittleEndian.PutUint16(buf[36:], flags)
-	binary.LittleEndian.PutUint64(buf[38:], uint64(ts))
+// TradeSign returns +1 for taker buy, -1 for taker sell.
+func TradeSign(row AggRow) float64 {
+	if row.Flags&1 != 0 {
+		// buyer is maker -> taker is seller
+		return -1.0
+	}
+	return 1.0
 }
 ```
 
@@ -508,7 +169,6 @@ func runData() {
 	}
 
 	end := time.Now().UTC().AddDate(0, 0, -1)
-
 	if end.Before(start) {
 		fmt.Println("Nothing to do.")
 		return
@@ -972,7 +632,6 @@ import (
 
 func main() {
 	// Hardware Optimization: Ryzen 9 7900X
-	// Force the Go runtime to schedule goroutines across all logical threads.
 	runtime.GOMAXPROCS(CPUThreads)
 
 	if len(os.Args) < 2 {
@@ -985,13 +644,13 @@ func main() {
 
 	switch cmd {
 	case "data":
-		runData() // Download + compress Binance data
-	case "ofi":
-		runOFI() // Mass-test OFI core directional variants
-	case "sum":
-		runSum() // Summarize OFI reports
+		runData() // Download
+	case "build":
+		runBuild() // Run Models -> .bin
+	case "study":
+		runStudy() // IS/OOS Stats
 	case "sanity":
-		runSanity() // Verify file integrity
+		runSanity() // Integrity Check
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 		printHelp()
@@ -1003,13 +662,10 @@ func main() {
 
 func printHelp() {
 	fmt.Println("Usage: quant.exe [command]")
-	fmt.Println("--- DATA PIPELINE ---")
-	fmt.Println("  data    - Download & compress raw aggTrades")
-	fmt.Println("--- ALPHA LAB ---")
-	fmt.Println("  ofi     - Test OFI core directional variants (15ms lag)")
-	fmt.Println("  sum     - Summarize OFI metrics (variant ranking)")
-	fmt.Println("--- AUDIT ---")
-	fmt.Println("  sanity  - Verify data/index integrity")
+	fmt.Println("  data   - Download raw aggTrades")
+	fmt.Println("  build  - Run Hawkes/Adaptive/EMA models -> features")
+	fmt.Println("  study  - Run IS/OOS backtest on features")
+	fmt.Println("  sanity - Check data integrity")
 }
 
 func getMemUsage() string {
@@ -1027,622 +683,115 @@ func getMemUsage() string {
 package main
 
 import (
-	"encoding/json"
 	"math"
-	"math/rand"
-	"os"
-	"sort"
 )
 
-// --- Top-Level Types --------------------------------------------------------
-
-// AlphaMetrics represents the full metrics set for one signal on one dataset
-// (e.g., one day, or one long run across many days).
-// Horizons map contains per-horizon performance stats keyed by horizon string
-// (e.g. "20", "50", "100").
-type AlphaMetrics struct {
-	Label   string                    `json:"label"`  // e.g. "BTCUSDT|OFI_VolumeTime_50M|2024-01-01"
-	NBars   int                       `json:"n_bars"` // number of samples used
-	Signal  SignalMetrics             `json:"signal"` // distribution / quality of the raw signal
-	Horizon map[string]HorizonMetrics `json:"horizons"`
+// MetricStats holds the metrics actually used by the study path.
+type MetricStats struct {
+	Count        int
+	ICPearson    float64 // linear IC
+	Sharpe       float64 // per-trade Sharpe
+	SharpeAnnual float64 // scaled Sharpe (sqrt(N) over sample)
+	HitRate      float64 // directional accuracy (non-zero signal & return)
+	BreakevenBps float64 // break-even cost per unit turnover (bps)
 }
 
-// SignalMetrics describes properties of the raw alpha signal (no horizon).
-type SignalMetrics struct {
-	Mean        float64 `json:"mean"`
-	StdDev      float64 `json:"std_dev"`
-	Skew        float64 `json:"skew"`
-	Kurtosis    float64 `json:"kurtosis"`
-	PctOutliers float64 `json:"pct_outliers"`
-	Autocorr    float64 `json:"autocorr_lag1"`
-	Turnover    float64 `json:"turnover_per_bar"`
-	ZeroPct     float64 `json:"pct_zero_signal"`
-	Hurst       float64 `json:"hurst_exponent"`
-	Entropy     float64 `json:"shannon_entropy"`
-}
-
-// HorizonMetrics describes predictive and PnL properties for a given
-// future-horizon (e.g. +20, +50, +100 ticks).
-type HorizonMetrics struct {
-	// Predictive Power
-	ICPearson         float64 `json:"ic_pearson"`          // Pearson IC
-	ICSpearman        float64 `json:"ic_spearman"`         // Rank IC
-	ICStd             float64 `json:"ic_std"`              // Std dev of rolling IC
-	ICIR              float64 `json:"ic_ir"`               // Information ratio of IC (mean/std of rolling IC)
-	ShuffledICPearson float64 `json:"shuffled_ic_pearson"` // IC after shuffling returns (leakage sanity)
-
-	TStat          float64 `json:"t_stat_beta"`     // t-stat of regression beta
-	DirectionalHit float64 `json:"directional_hit"` // P(sign(sig) == sign(ret))
-
-	// Linear Relationship
-	Alpha float64 `json:"alpha"` // regression intercept (returns space)
-	Beta  float64 `json:"beta"`  // regression slope (signal -> returns)
-
-	// Monotonicity / Execution
-	DecileSpreadBps float64 `json:"decile_spread_bps"` // top-bottom decile spread
-	BreakevenBps    float64 `json:"breakeven_cost_bps"`
-	FillRate        float64 `json:"fill_rate_est"`
-
-	// Returns Profile (Sharpe-style)
-	TheoreticalSharpe float64 `json:"theoretical_sharpe"`
-	HACSharpe         float64 `json:"hac_sharpe"`
-	ProbSharpeRatio   float64 `json:"prob_sharpe_ratio"`
-	SortinoRatio      float64 `json:"sortino_ratio"`
-	CalmarRatio       float64 `json:"calmar_ratio"`
-
-	// Trade Statistics
-	WinRate      float64 `json:"win_rate"`
-	ProfitFactor float64 `json:"profit_factor"`
-	AvgWinLoss   float64 `json:"avg_win_loss_ratio"`
-
-	// Alpha Decay
-	AlphaHalfLifeBars float64 `json:"alpha_half_life_bars"` // half-life in bars
-	AlphaHalfLifeMs   float64 `json:"alpha_half_life_ms"`   // half-life in milliseconds (filled by caller)
-}
-
-// --- Signal / Horizon Metric Calculators -----------------------------------
-
-// ComputeSignalMetrics analyzes the distribution and stability of a raw signal
-// (no horizon notion here).
-func ComputeSignalMetrics(sig []float64) SignalMetrics {
-	s := SignalMetrics{}
+// ComputeStats calculates IC, Sharpe, hit rate, and break-even cost
+// for a signal vs return series. sig and ret must be aligned and of
+// equal length. This function is called very frequently in the study
+// pipeline and is written to be single-pass and branch-light.
+func ComputeStats(sig, ret []float64) MetricStats {
 	n := len(sig)
-	if n == 0 {
-		return s
+	if n < 2 {
+		return MetricStats{}
 	}
 
-	m := Mean(sig)
-	s.Mean = m
-	s.StdDev = StdDev(sig, m)
+	ms := MetricStats{Count: n}
 
-	if s.StdDev == 0 {
-		// Degenerate constant signal
-		return s
-	}
-
-	outliers := 0
-	zeros := 0
-	sumDiff := 0.0
-
-	sum3 := 0.0
-	sum4 := 0.0
-
-	for i, v := range sig {
-		if math.Abs((v-m)/s.StdDev) > 3.0 {
-			outliers++
-		}
-		if math.Abs(v) < 1e-9 {
-			zeros++
-		}
-		if i > 0 {
-			sumDiff += math.Abs(v - sig[i-1])
-		}
-		d := (v - m) / s.StdDev
-		sum3 += d * d * d
-		sum4 += d * d * d * d
-	}
-
-	s.PctOutliers = float64(outliers) / float64(n)
-	s.Turnover = sumDiff / float64(n)
-	s.ZeroPct = float64(zeros) / float64(n)
-	s.Skew = sum3 / float64(n)
-	s.Kurtosis = (sum4 / float64(n)) - 3.0
-
-	s.Autocorr = AutoCorrelation(sig, 1)
-	s.Hurst = EstimateHurst(sig)
-	s.Entropy = EstimateEntropy(sig, 50)
-
-	return s
-}
-
-// ComputeHorizonMetrics computes all key directional + PnL metrics for a given
-// signal and aligned future returns at some horizon.
-func ComputeHorizonMetrics(sig, ret []float64) HorizonMetrics {
-	h := HorizonMetrics{}
-	n := len(sig)
-	if n == 0 || n != len(ret) {
-		return h
-	}
-	if n < 200 {
-		// Require some minimum sample size for stable stats
-		return h
-	}
-
-	// 1. Basic correlations / regression
-	h.ICPearson = Correlation(sig, ret)
-	h.ICSpearman = SpearmanCorrelation(sig, ret)
-
-	alpha, beta := SimpleOLS(sig, ret)
-	h.Alpha = alpha
-	h.Beta = beta
-
-	// T-Stat on beta
-	mx := Mean(sig)
-	rss, sx := 0.0, 0.0
-	for i := 0; i < n; i++ {
-		pred := alpha + beta*sig[i]
-		resid := ret[i] - pred
-		rss += resid * resid
-		d := sig[i] - mx
-		sx += d * d
-	}
-	if sx > 0 {
-		stdErr := math.Sqrt(rss / float64(n-2))
-		if stdErr > 0 {
-			h.TStat = beta / (stdErr / math.Sqrt(sx))
-		}
-	}
-
-	// 2. Directional hit rate
-	h.DirectionalHit = directionalHitRate(sig, ret)
-
-	// 3. Monotonicity via quantile spread
-	h.DecileSpreadBps = CalcQuantileSpread(sig, ret, 10) * 10000.0
-
-	// 4. PnL stream & execution-style metrics
 	var (
-		grossWin, grossLoss   float64
-		wins, losses          float64
-		totalPnL, turnover    float64
-		downsideSq, returnsSq float64
-		peakCumPnl, maxDD     float64
-		cumPnl                float64
-		pnlStream             = make([]float64, n)
-		filledCount           = 0.0
+		sumSig, sumRet     float64
+		sumSqSig, sumSqRet float64
+		sumProd            float64
+
+		// PnL aggregates
+		sumPnL, sumSqPnL float64
+
+		// Hit-rate aggregates
+		hits, validHits float64
+
+		// Turnover
+		turnover float64
+		prevSig  float64
 	)
 
-	prevSig := 0.0
-	for i := 0; i < n; i++ {
-		// Fill heuristic: we assume a trade is filled if |ret| > 0.5 bps
-		if math.Abs(ret[i]) > 0.00005 {
-			filledCount++
-		}
-
-		pnl := sig[i] * ret[i]
-		pnlStream[i] = pnl
-		totalPnL += pnl
-
-		if i > 0 {
-			turnover += math.Abs(sig[i] - prevSig)
-		}
-		prevSig = sig[i]
-
-		if pnl > 0 {
-			grossWin += pnl
-			wins++
-		} else if pnl < 0 {
-			grossLoss += math.Abs(pnl)
-			losses++
-			downsideSq += pnl * pnl
-		}
-
-		cumPnl += pnl
-		if cumPnl > peakCumPnl {
-			peakCumPnl = cumPnl
-		}
-		if (peakCumPnl - cumPnl) > maxDD {
-			maxDD = peakCumPnl - cumPnl
-		}
-		returnsSq += pnl * pnl
-	}
-
-	// Fill rate
-	h.FillRate = filledCount / float64(n)
-
-	// Breakeven cost (bps) = PnL per unit turnover
-	if turnover > 0 {
-		h.BreakevenBps = (totalPnL / turnover) * 10000.0
-	}
-
-	// Hit stats
-	if (wins + losses) > 0 {
-		h.WinRate = wins / (wins + losses)
-	}
-	if grossLoss > 0 {
-		h.ProfitFactor = grossWin / grossLoss
-		if wins > 0 {
-			avgWin := grossWin / wins
-			avgLoss := grossLoss / losses
-			if avgLoss > 0 {
-				h.AvgWinLoss = avgWin / avgLoss
-			}
-		}
-	} else if grossWin > 0 {
-		h.ProfitFactor = 100.0
-	}
-
-	// 5. Sharpe / Sortino / Calmar
-	meanPnl := totalPnL / float64(n)
-	varPnl := (returnsSq / float64(n)) - (meanPnl * meanPnl)
-	stdPnl := math.Sqrt(varPnl)
-
-	// barsPerYear: adjust if you change horizon semantics
-	const barsPerYear = 288.0 * 365.0 // 5-min-equivalent
-
-	if stdPnl > 0 {
-		h.TheoreticalSharpe = (meanPnl / stdPnl) * math.Sqrt(barsPerYear)
-
-		if downsideSq > 0 {
-			downsideDev := math.Sqrt(downsideSq / float64(n))
-			if downsideDev > 0 {
-				h.SortinoRatio = (meanPnl / downsideDev) * math.Sqrt(barsPerYear)
-			}
-		}
-	}
-
-	if maxDD > 0 {
-		h.CalmarRatio = totalPnL / maxDD
-	}
-
-	// 6. HAC Sharpe & Prob(SR>0)
-	rho := AutoCorrelation(pnlStream, 1)
-	nwAdj := 1.0
-	if math.Abs(rho) < 1.0 {
-		nwAdj = math.Sqrt(1.0 - rho*rho)
-	}
-	h.HACSharpe = h.TheoreticalSharpe * nwAdj
-
-	if stdPnl > 0 {
-		skew, kurt := CalcHigherMoments(pnlStream)
-		sr := meanPnl / stdPnl
-		denominator := math.Sqrt(1.0 - skew*sr + ((kurt-1.0)/4.0)*sr*sr)
-		if denominator > 0 {
-			zVal := (sr * math.Sqrt(float64(n)-1.0)) / denominator
-			h.ProbSharpeRatio = NormalCDF(zVal)
-		}
-	}
-
-	// 7. Alpha half-life estimation from autocorrelation of signal
-	h.AlphaHalfLifeBars = estimateHalfLifeBars(sig)
-
-	// 8. Rolling IC stats for ICIR
-	const icWindow = 2000
-	meanICw, stdICw := rollingICStats(sig, ret, icWindow)
-	if stdICw > 0 {
-		h.ICStd = stdICw
-		h.ICIR = meanICw / stdICw
-	}
-
-	// 9. Permutation IC sanity (anti-leakage check)
-	h.ShuffledICPearson = shuffledIC(sig, ret)
-
-	return h
-}
-
-// directionalHitRate: probability that signal and return have matching sign.
-func directionalHitRate(sig, ret []float64) float64 {
-	n := len(sig)
-	if n == 0 || n != len(ret) {
-		return 0
-	}
-	hits := 0
-	valid := 0
 	for i := 0; i < n; i++ {
 		s := sig[i]
 		r := ret[i]
-		if s == 0 || r == 0 {
-			continue
+
+		// Moments for Pearson IC
+		sumSig += s
+		sumRet += r
+		sumSqSig += s * s
+		sumSqRet += r * r
+		sumProd += s * r
+
+		// PnL stats
+		pnl := s * r
+		sumPnL += pnl
+		sumSqPnL += pnl * pnl
+
+		// Hit rate (directional)
+		if s != 0 && r != 0 {
+			validHits++
+			if (s > 0 && r > 0) || (s < 0 && r < 0) {
+				hits++
+			}
 		}
-		valid++
-		if (s > 0 && r > 0) || (s < 0 && r < 0) {
-			hits++
+
+		// Turnover (L1 change of signal)
+		if i > 0 {
+			turnover += math.Abs(s - prevSig)
 		}
-	}
-	if valid == 0 {
-		return 0
-	}
-	return float64(hits) / float64(valid)
-}
-
-// estimateHalfLifeBars computes a half-life in "bars" based on log-ACF vs lag.
-func estimateHalfLifeBars(sig []float64) float64 {
-	n := len(sig)
-	if n < 3 {
-		return 0
-	}
-	lags := []float64{1, 2, 3, 4, 5}
-	logAc := make([]float64, len(lags))
-	for k := range lags {
-		ac := AutoCorrelation(sig, int(lags[k]))
-		if ac <= 0 {
-			ac = 0.0001
-		}
-		logAc[k] = math.Log(ac)
-	}
-	_, slope := SimpleOLS(lags, logAc)
-	if slope < 0 {
-		// half-life in "bars"
-		return -0.693147 / slope
-	}
-	return 0
-}
-
-// rollingICStats computes mean/std of IC over non-overlapping windows.
-func rollingICStats(sig, ret []float64, window int) (meanIC, stdIC float64) {
-	n := len(sig)
-	if n != len(ret) || n < window*2 {
-		return 0, 0
-	}
-	// non-overlapping windows
-	var ics []float64
-	for i := 0; i+window <= n; i += window {
-		ic := Correlation(sig[i:i+window], ret[i:i+window])
-		ics = append(ics, ic)
-	}
-	if len(ics) < 2 {
-		return 0, 0
-	}
-	m := Mean(ics)
-	sumSq := 0.0
-	for _, v := range ics {
-		d := v - m
-		sumSq += d * d
-	}
-	std := math.Sqrt(sumSq / float64(len(ics)-1))
-	return m, std
-}
-
-// shuffledIC computes IC between signal and a shuffled version of ret.
-func shuffledIC(sig, ret []float64) float64 {
-	n := len(sig)
-	if n == 0 || n != len(ret) {
-		return 0
-	}
-	tmp := make([]float64, n)
-	copy(tmp, ret)
-	// deterministic seed based on length
-	r := rand.New(rand.NewSource(int64(n)*7919 + 1234567))
-	for i := n - 1; i > 0; i-- {
-		j := r.Intn(i + 1)
-		tmp[i], tmp[j] = tmp[j], tmp[i]
-	}
-	return Correlation(sig, tmp)
-}
-
-// --- Advanced Math Helpers --------------------------------------------------
-
-// CalcHigherMoments returns (skew, excess kurtosis) of x.
-func CalcHigherMoments(x []float64) (skew, kurt float64) {
-	n := float64(len(x))
-	if n < 3 {
-		return 0, 0
-	}
-	m := Mean(x)
-	s := StdDev(x, m)
-	if s == 0 {
-		return 0, 0
+		prevSig = s
 	}
 
-	sum3, sum4 := 0.0, 0.0
-	for _, v := range x {
-		d := (v - m) / s
-		sum3 += d * d * d
-		sum4 += d * d * d * d
-	}
-	skew = sum3 / n
-	kurt = (sum4 / n) - 3.0
-	return
-}
+	fn := float64(n)
 
-// NormalCDF is Phi(x) for standard normal.
-func NormalCDF(x float64) float64 {
-	return 0.5 * (1 + math.Erf(x/math.Sqrt2))
-}
-
-// AutoCorrelation uses Pearson Correlation lagged by "lag".
-func AutoCorrelation(x []float64, lag int) float64 {
-	n := len(x)
-	if lag >= n || lag <= 0 {
-		return 0
-	}
-	return Correlation(x[:n-lag], x[lag:])
-}
-
-// SimpleOLS fits y = alpha + beta*x using least squares.
-func SimpleOLS(x, y []float64) (alpha, beta float64) {
-	if len(x) == 0 || len(x) != len(y) {
-		return 0, 0
-	}
-	mx, my := Mean(x), Mean(y)
-	num, den := 0.0, 0.0
-	for i := 0; i < len(x); i++ {
-		dx := x[i] - mx
-		num += dx * (y[i] - my)
-		den += dx * dx
-	}
-	if den == 0 {
-		return 0, 0
-	}
-	beta = num / den
-	alpha = my - beta*mx
-	return
-}
-
-type rankPair struct {
-	val float64
-	idx int
-}
-
-// SpearmanCorrelation = Pearson correlation of ranks.
-func SpearmanCorrelation(x, y []float64) float64 {
-	if len(x) == 0 || len(x) != len(y) {
-		return 0
-	}
-	rx := getRanks(x)
-	ry := getRanks(y)
-	return Correlation(rx, ry)
-}
-
-func getRanks(v []float64) []float64 {
-	n := len(v)
-	pairs := make([]rankPair, n)
-	for i, val := range v {
-		pairs[i] = rankPair{val, i}
-	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].val < pairs[j].val })
-	ranks := make([]float64, n)
-	for i, p := range pairs {
-		ranks[p.idx] = float64(i + 1)
-	}
-	return ranks
-}
-
-// CalcQuantileSpread: top-vs-bottom bucket mean return for a ranking signal.
-func CalcQuantileSpread(sig, ret []float64, buckets int) float64 {
-	n := len(sig)
-	if n == 0 || n != len(ret) || buckets <= 1 {
-		return 0
-	}
-	pairs := make([]rankPair, n)
-	for i, val := range sig {
-		pairs[i] = rankPair{val, i}
-	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].val < pairs[j].val })
-
-	sz := n / buckets
-	if sz == 0 {
-		return 0
+	// 1) Pearson IC
+	num := fn*sumProd - sumSig*sumRet
+	denX := fn*sumSqSig - sumSig*sumSig
+	denY := fn*sumSqRet - sumRet*sumRet
+	if denX > 0 && denY > 0 {
+		ms.ICPearson = num / math.Sqrt(denX*denY)
 	}
 
-	sumBot, sumTop := 0.0, 0.0
-	for i := 0; i < sz; i++ {
-		sumBot += ret[pairs[i].idx]
-	}
-	for i := n - sz; i < n; i++ {
-		sumTop += ret[pairs[i].idx]
-	}
-	return (sumTop / float64(sz)) - (sumBot / float64(sz))
-}
-
-// EstimateEntropy: Shannon entropy in bits, using fixed binning.
-func EstimateEntropy(x []float64, bins int) float64 {
-	n := len(x)
-	if n == 0 || bins <= 1 {
-		return 0
-	}
-	minV, maxV := x[0], x[0]
-	for _, v := range x {
-		if v < minV {
-			minV = v
-		}
-		if v > maxV {
-			maxV = v
-		}
-	}
-	if minV == maxV {
-		return 0
-	}
-	hist := make([]int, bins)
-	rng := maxV - minV
-	for _, v := range x {
-		idx := int(float64(bins) * (v - minV) / rng)
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= bins {
-			idx = bins - 1
-		}
-		hist[idx]++
-	}
-	entropy := 0.0
-	total := float64(n)
-	for _, c := range hist {
-		if c > 0 {
-			p := float64(c) / total
-			entropy -= p * math.Log2(p)
-		}
-	}
-	return entropy
-}
-
-// EstimateHurst: simple R/S-based proxy for Hurst exponent over the full series.
-func EstimateHurst(x []float64) float64 {
-	n := len(x)
-	if n < 10 {
-		return 0.5
-	}
-	m := Mean(x)
-	cumDev := 0.0
-	maxCum, minCum := -1e9, 1e9
-	ss := 0.0
-
-	for _, v := range x {
-		dev := v - m
-		cumDev += dev
-		if cumDev > maxCum {
-			maxCum = cumDev
-		}
-		if cumDev < minCum {
-			minCum = cumDev
-		}
-		ss += dev * dev
+	// 2) Sharpe per trade and "annualized" via sqrt(N) over sample.
+	meanPnL := sumPnL / fn
+	varPnL := (sumSqPnL / fn) - (meanPnL * meanPnL)
+	if varPnL > 0 {
+		stdPnL := math.Sqrt(varPnL)
+		sh := meanPnL / stdPnL
+		ms.Sharpe = sh
+		ms.SharpeAnnual = sh * math.Sqrt(fn)
 	}
 
-	std := math.Sqrt(ss / float64(n))
-	if std == 0 {
-		return 0.5
+	// 3) Hit rate
+	if validHits > 0 {
+		ms.HitRate = hits / validHits
 	}
-	rRange := maxCum - minCum
-	return math.Log(rRange/std) / math.Log(float64(n))
-}
 
-// --- Persistence ------------------------------------------------------------
+	// 4) Break-even cost in bps per unit turnover.
+	if turnover > 0 {
+		ms.BreakevenBps = (sumPnL / turnover) * 10000.0
+	}
 
-// SaveAlphaMetrics writes a slice of AlphaMetrics to a JSON file.
-func SaveAlphaMetrics(path string, metrics []AlphaMetrics) error {
-	if err := os.MkdirAll(filepathDir(path), 0755); err != nil {
-		return err
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(metrics)
-}
-
-// filepathDir is a tiny helper to avoid importing filepath just for Dir.
-func filepathDir(path string) string {
-	last := -1
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' || path[i] == '\\' {
-			last = i
-			break
-		}
-	}
-	if last <= 0 {
-		return "."
-	}
-	return path[:last]
+	return ms
 }
 ```
 
 // --- End File: metrics.go ---
 
-// --- File: ofi.go ---
+// --- File: ofibuild.go ---
 
 ```go
 package main
@@ -1656,314 +805,216 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"sync"
 	"time"
 )
 
-// --- Configuration ----------------------------------------------------------
+// --- Build Configuration ---
 
+// Concurrency and buffer sizing for the feature builder.
 const (
-	OFIExecutionLagMS = 15   // execution/network lag in milliseconds
-	OFIWarmupTrades   = 2000 // ignore first N trades for metrics
+	BuildThreads = 24         // use all 24 logical cores
+	BuildMaxRows = 10_000_000 // initial per-thread row budget for signal buffers
 )
 
-// Horizons to test (in ticks after entry)
-var OFIHorizons = []int{20, 50, 100}
-
-// --- Task ID ---------------------------------------------------------------
-
-type ofiTask struct {
-	Y, M, D int
-}
-
-// --- Variant Configuration --------------------------------------------------
-
-type OFIVariant struct {
-	ID           string  // label: "OFI_VolumeTime_50M", etc.
-	Kind         string  // "voltime", "invariant", "depth", "cluster", "raw"
-	Alpha        float64 // EMA alpha (for non-voltime variants)
-	DollarLambda float64 // for VolumeTime variants: exp(-dollar / lambda), 0 if unused
-	NThreshold   int     // threshold on n_t (trade count), e.g. 13
-	NBoost       float64 // depth / cluster weight multiplier
-	UseDepth     bool    // multiply flow by n_t
-	ZWindow      int     // rolling z-score window; 0 = off
-	ResetEvery   int     // reset OFI every N trades (event-time); 0 = off
-}
-
-// Complete list of OFI variants to test.
-var ofiVariants = []OFIVariant{
+var BuildVariants = []VariantDef{
 	{
-		ID:           "OFI_VolumeTime_50M",
-		Kind:         "voltime",
-		DollarLambda: 50_000_000,
+		ID:    "A_Hawkes_Core",
+		Model: "Hawkes2Scale",
+		Cfg: Hawkes2ScaleConfig{
+			TauFast: 5, TauSlow: 60,
+			MuBuy: 0.1, MuSell: 0.1,
+			A_pp_fast: 0.8, A_pm_fast: 0.2, A_mp_fast: 0.2, A_mm_fast: 0.8,
+			A_pp_slow: 0.4, A_pm_slow: 0.1, A_mp_slow: 0.1, A_mm_slow: 0.4,
+			D0: 50_000, VolLambda: 0.999, ZScoreLambda: 0.9995, SquashScale: 1.5,
+		},
 	},
 	{
-		ID:           "OFI_VolumeTime_30M",
-		Kind:         "voltime",
-		DollarLambda: 30_000_000,
+		ID:    "B_Hawkes_Adaptive",
+		Model: "HawkesAdaptive",
+		Cfg: HawkesAdaptiveConfig{
+			HawkesCfg: Hawkes2ScaleConfig{
+				TauFast: 2, TauSlow: 300,
+				MuBuy: 0.1, MuSell: 0.1,
+				A_pp_fast: 1.2, A_pm_fast: 0.0, A_mp_fast: 0.0, A_mm_fast: 1.2,
+				A_pp_slow: 0.3, A_pm_slow: 0.1, A_mp_slow: 0.1, A_mm_slow: 0.3,
+				D0: 50_000, VolLambda: 0.999, ZScoreLambda: 0.9999, SquashScale: 2.0,
+			},
+			ActivityLambda: 0.99, ActMid: 15.0, ActSlope: 2.0,
+		},
 	},
 	{
-		ID:         "OFI_Invariant_2025_Slow",
-		Kind:       "invariant",
-		Alpha:      0.018,
-		NThreshold: 13,
-		NBoost:     8.5,
-		UseDepth:   true,
+		ID:    "C_MultiEMA_PowerLaw",
+		Model: "MultiEMA",
+		Cfg: MultiEMAConfig{
+			TauSec:       []float64{10, 60, 300, 1800},
+			Weights:      []float64{0.4, 0.3, 0.2, 0.1},
+			D0:           50_000,
+			VolLambda:    0.999,
+			ZScoreLambda: 0.9995,
+			SquashScale:  1.5,
+		},
 	},
 	{
-		ID:         "OFI_Invariant_2025_Fast",
-		Kind:       "invariant",
-		Alpha:      0.052,
-		NThreshold: 13,
-		NBoost:     8.5,
-		UseDepth:   true,
-	},
-	{
-		ID:       "OFI_ZScore_DepthWeighted_20k",
-		Kind:     "depth",
-		Alpha:    0.04,
-		UseDepth: true,
-		ZWindow:  20_000,
-	},
-	{
-		ID:         "OFI_EventTime_2000",
-		Kind:       "depth",
-		Alpha:      0.08,
-		UseDepth:   true,
-		ResetEvery: 2_000,
-	},
-	{
-		ID:       "OFI_DepthWeighted_SlowEMA",
-		Kind:     "depth",
-		Alpha:    0.015,
-		UseDepth: true,
-	},
-	{
-		ID:         "OFI_ClusterBoost_9_5x",
-		Kind:       "cluster",
-		Alpha:      0.05,
-		NThreshold: 13,
-		NBoost:     9.5,
-	},
-	{
-		ID:      "OFI_ZScore10k_Raw_Slow",
-		Kind:    "raw",
-		Alpha:   0.02,
-		ZWindow: 10_000,
+		ID:    "D_EMA_Baseline",
+		Model: "EMA",
+		Cfg: EMAConfig{
+			TauSec:       30,
+			D0:           50_000,
+			VolLambda:    0.999,
+			ZScoreLambda: 0.9995,
+			SquashScale:  1.5,
+		},
 	},
 }
 
-// --- OFI State --------------------------------------------------------------
+// --- Main Builder ---
 
-type ofiState struct {
-	cfg *OFIVariant
+func runBuild() {
+	start := time.Now()
+	featRoot := filepath.Join(BaseDir, "features", Symbol)
+	fmt.Printf("--- FEATURE BUILDER | %s | %d Variants ---\n", Symbol, len(BuildVariants))
+	fmt.Printf("Output: %s\n", featRoot)
 
-	ofi        float64
-	tradeCount int // for ResetEvery
-
-	// rolling z-score state
-	zBuf   []float64
-	zHead  int
-	zCount int
-	zSum   float64
-	zSumSq float64
-}
-
-func newOFIState(cfg *OFIVariant) *ofiState {
-	return &ofiState{
-		cfg: cfg,
-	}
-}
-
-func (s *ofiState) updateZScore(value float64) float64 {
-	w := s.cfg.ZWindow
-	if w <= 0 {
-		return value
-	}
-	if s.zBuf == nil {
-		s.zBuf = make([]float64, w)
+	// 1. Initialize Directories for each variant
+	for _, v := range BuildVariants {
+		_ = os.MkdirAll(filepath.Join(featRoot, v.ID), 0755)
 	}
 
-	if s.zCount < w {
-		// still filling window
-		s.zBuf[s.zHead] = value
-		s.zSum += value
-		s.zSumSq += value * value
-		s.zCount++
-		s.zHead++
-		if s.zHead == w {
-			s.zHead = 0
+	// 2. Discover Tasks (only days that actually exist in index.quantdev)
+	tasks := discoverTasks()
+	fmt.Printf("[build] Processing %d days.\n", len(tasks))
+
+	// Worker count (bounded by CPUThreads)
+	workerCount := BuildThreads
+	if workerCount > CPUThreads {
+		workerCount = CPUThreads
+	}
+	fmt.Printf("[build] Using %d threads.\n", workerCount)
+
+	// 3. Worker Pool
+	var wg sync.WaitGroup
+	jobs := make(chan ofiTask, len(tasks))
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Per-thread buffer reused to reduce GC.
+			// Initial capacity is BuildMaxRows, but will grow if a day exceeds that.
+			binBuf := make([]byte, 0, BuildMaxRows*8)
+
+			for t := range jobs {
+				processBuildDay(t, featRoot, &binBuf)
+			}
+		}()
+	}
+
+	for _, t := range tasks {
+		jobs <- t
+	}
+	close(jobs)
+	wg.Wait()
+
+	fmt.Printf("[build] Complete in %s\n", time.Since(start))
+}
+
+// processBuildDay: load raw AGG3 data ONCE for (Y,M,D), then fan out to all variants.
+func processBuildDay(t ofiTask, root string, binBuf *[]byte) {
+	// 1. Load Data
+	rawBytes, rowCount, ok := loadRawDay(t.Y, t.M, t.D)
+	if !ok || rowCount == 0 {
+		return
+	}
+	dateStr := fmt.Sprintf("%04d%02d%02d", t.Y, t.M, t.D)
+
+	// 2. Process Each Variant
+	for _, v := range BuildVariants {
+		outPath := filepath.Join(root, v.ID, dateStr+".bin")
+
+		// Skip if exists
+		if _, err := os.Stat(outPath); err == nil {
+			continue
 		}
-	} else {
-		// full window: replace oldest
-		old := s.zBuf[s.zHead]
-		s.zBuf[s.zHead] = value
-		s.zSum += value - old
-		s.zSumSq += value*value - old*old
-		s.zHead++
-		if s.zHead == w {
-			s.zHead = 0
+
+		// 3. Init Model State
+		model := createModel(v)
+		if model == nil {
+			continue
+		}
+
+		// 4. Run Update Loop
+		n := int(rowCount)
+		reqSize := n * 8
+		if cap(*binBuf) < reqSize {
+			// In the rare case a day exceeds BuildMaxRows, grow the buffer once.
+			*binBuf = make([]byte, reqSize)
+		}
+		*binBuf = (*binBuf)[:reqSize]
+
+		for i := 0; i < n; i++ {
+			off := i * RowSize
+			row := ParseAggRow(rawBytes[off : off+RowSize])
+
+			sig := model.Update(row)
+
+			// Store as little-endian float64
+			binary.LittleEndian.PutUint64((*binBuf)[i*8:], math.Float64bits(sig))
+		}
+
+		// 5. Write Disk
+		if err := os.WriteFile(outPath, *binBuf, 0644); err != nil {
+			fmt.Printf("[err] write %s: %v\n", outPath, err)
 		}
 	}
-
-	if s.zCount < 2 {
-		return 0
-	}
-	mean := s.zSum / float64(s.zCount)
-	variance := s.zSumSq/float64(s.zCount) - mean*mean
-	if variance <= 0 {
-		return 0
-	}
-	return (value - mean) / math.Sqrt(variance)
 }
 
-// Update computes the OFI signal for a single tick.
-func (s *ofiState) Update(px, qty float64, nTrades int, sign float64) float64 {
-	cfg := s.cfg
+// --- Data Loader ---
 
-	// base signed flow
-	flow := sign * qty
-	if cfg.UseDepth {
-		flow *= float64(nTrades)
-	}
-
-	switch cfg.Kind {
-	case "voltime":
-		// OFI_t = s_t q_t p_t + exp(- q_t p_t / Lambda) * OFI_{t-1}
-		dollar := qty * px
-		decay := math.Exp(-dollar / cfg.DollarLambda)
-		s.ofi = sign*qty*px + decay*s.ofi
-
-	case "invariant":
-		// f_t = s q w(n); w boosted above threshold
-		w := float64(nTrades)
-		if nTrades >= cfg.NThreshold {
-			w *= cfg.NBoost
-		}
-		f := sign * qty * w
-		alpha := cfg.Alpha
-		s.ofi = alpha*f + (1.0-alpha)*s.ofi
-
-	case "cluster":
-		// w_t = { NBoost if n >= threshold; 1 else }
-		w := 1.0
-		if nTrades >= cfg.NThreshold {
-			w = cfg.NBoost
-		}
-		f := sign * qty * w
-		alpha := cfg.Alpha
-		s.ofi = alpha*f + (1.0-alpha)*s.ofi
-
-	case "depth", "raw":
-		// f is flow or depth-weighted flow
-		alpha := cfg.Alpha
-		s.ofi = alpha*flow + (1.0-alpha)*s.ofi
-
-	default:
-		// fallback: raw EMA on flow
-		alpha := cfg.Alpha
-		s.ofi = alpha*flow + (1.0-alpha)*s.ofi
-	}
-
-	s.tradeCount++
-	if cfg.ResetEvery > 0 && s.tradeCount >= cfg.ResetEvery {
-		s.ofi = 0
-		s.tradeCount = 0
-	}
-
-	value := s.ofi
-	if cfg.ZWindow > 0 {
-		value = s.updateZScore(value)
-	}
-	return value
-}
-
-// --- Tick Series Loader -----------------------------------------------------
-
-// loadDayTicks loads one day from data.quantdev for (y,m,d) and returns
-// SoA arrays: timestamps, prices, qty, sign, nTrades.
-//
-// sign = +1 for taker buy, -1 for taker sell
-func loadDayTicks(y, m, d int) (ts []int64, px, qty, sign []float64, nTrades []int, ok bool) {
+func loadRawDay(y, m, d int) ([]byte, uint64, bool) {
 	dir := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", y), fmt.Sprintf("%02d", m))
 	idxPath := filepath.Join(dir, "index.quantdev")
 	dataPath := filepath.Join(dir, "data.quantdev")
 
-	offset, length := findBlobOFI(idxPath, d)
+	offset, length := findBlobOffset(idxPath, d)
 	if length == 0 {
-		return nil, nil, nil, nil, nil, false
+		return nil, 0, false
 	}
 
 	f, err := os.Open(dataPath)
 	if err != nil {
-		return nil, nil, nil, nil, nil, false
+		return nil, 0, false
 	}
 	defer f.Close()
 
 	if _, err := f.Seek(int64(offset), io.SeekStart); err != nil {
-		return nil, nil, nil, nil, nil, false
+		return nil, 0, false
 	}
 
 	compData := make([]byte, length)
 	if _, err := io.ReadFull(f, compData); err != nil {
-		return nil, nil, nil, nil, nil, false
+		return nil, 0, false
 	}
 
 	r, err := zlib.NewReader(bytes.NewReader(compData))
 	if err != nil {
-		return nil, nil, nil, nil, nil, false
+		return nil, 0, false
 	}
-	blob, err := io.ReadAll(r)
+	raw, err := io.ReadAll(r)
 	r.Close()
 	if err != nil {
-		return nil, nil, nil, nil, nil, false
+		return nil, 0, false
 	}
 
-	if len(blob) < HeaderSize {
-		return nil, nil, nil, nil, nil, false
+	if len(raw) < HeaderSize {
+		return nil, 0, false
 	}
-
-	rowCount := binary.LittleEndian.Uint64(blob[8:])
-	body := blob[HeaderSize:]
-	n := int(rowCount)
-
-	ts = make([]int64, n)
-	px = make([]float64, n)
-	qty = make([]float64, n)
-	sign = make([]float64, n)
-	nTrades = make([]int, n)
-
-	invPx := 1.0 / PxScale
-	invQt := 1.0 / QtScale
-
-	rowOff := 0
-	for i := 0; i < n; i++ {
-		pxRaw := binary.LittleEndian.Uint64(body[rowOff+8:])
-		qtyRaw := binary.LittleEndian.Uint64(body[rowOff+16:])
-		cntRaw := binary.LittleEndian.Uint32(body[rowOff+32:])
-		flags := binary.LittleEndian.Uint16(body[rowOff+36:])
-		tsRaw := binary.LittleEndian.Uint64(body[rowOff+38:])
-		rowOff += RowSize
-
-		px[i] = float64(pxRaw) * invPx
-		qty[i] = float64(qtyRaw) * invQt
-		nTrades[i] = int(cntRaw)
-		ts[i] = int64(tsRaw)
-
-		// flags bit 0: 0 => taker buy, 1 => taker sell (from fastZipToAgg3)
-		if (flags & 1) == 0 {
-			sign[i] = 1.0
-		} else {
-			sign[i] = -1.0
-		}
-	}
-
-	return ts, px, qty, sign, nTrades, true
+	rowCount := binary.LittleEndian.Uint64(raw[8:])
+	return raw[HeaderSize:], rowCount, true
 }
 
-func findBlobOFI(idxPath string, day int) (uint64, uint64) {
+func findBlobOffset(idxPath string, day int) (uint64, uint64) {
 	f, err := os.Open(idxPath)
 	if err != nil {
 		return 0, 0
@@ -1974,15 +1025,11 @@ func findBlobOFI(idxPath string, day int) (uint64, uint64) {
 	if _, err := io.ReadFull(f, hdr); err != nil {
 		return 0, 0
 	}
-	if string(hdr[:4]) != IdxMagic {
-		return 0, 0
-	}
 	count := binary.LittleEndian.Uint64(hdr[8:])
-
 	row := make([]byte, 26)
 	for i := uint64(0); i < count; i++ {
 		if _, err := io.ReadFull(f, row); err != nil {
-			return 0, 0
+			break
 		}
 		if int(binary.LittleEndian.Uint16(row[0:])) == day {
 			return binary.LittleEndian.Uint64(row[2:]), binary.LittleEndian.Uint64(row[10:])
@@ -1991,204 +1038,26 @@ func findBlobOFI(idxPath string, day int) (uint64, uint64) {
 	return 0, 0
 }
 
-// --- Lag / Horizon Helpers --------------------------------------------------
-
-func buildEntryIndex(ts []int64, lagMS int64) []int {
-	n := len(ts)
-	idx := make([]int, n)
-	j := 0
-	for i := 0; i < n; i++ {
-		target := ts[i] + lagMS
-		if j < i {
-			j = i
-		}
-		for j < n && ts[j] < target {
-			j++
-		}
-		if j >= n {
-			idx[i] = -1
-		} else {
-			idx[i] = j
-		}
-	}
-	return idx
-}
-
-type horizonData struct {
-	ret   []float64
-	valid []bool
-}
-
-func buildHorizonData(px []float64, entryIdx []int, horizon, warmup int) horizonData {
-	n := len(px)
-	ret := make([]float64, n)
-	valid := make([]bool, n)
-
-	for i := warmup; i < n; i++ {
-		e := entryIdx[i]
-		if e < 0 || e+horizon >= n {
-			continue
-		}
-		pEntry := px[e]
-		pExit := px[e+horizon]
-		if pEntry <= 0 {
-			continue
-		}
-		ret[i] = (pExit - pEntry) / pEntry
-		valid[i] = true
-	}
-
-	return horizonData{
-		ret:   ret,
-		valid: valid,
-	}
-}
-
-// computeSignalSeries runs one OFI variant over all ticks and returns the
-// signal series (length n).
-func computeSignalSeries(cfg *OFIVariant, px, qty []float64, nTrades []int, sign []float64) []float64 {
-	n := len(px)
-	out := make([]float64, n)
-	state := newOFIState(cfg)
-	for i := 0; i < n; i++ {
-		out[i] = state.Update(px[i], qty[i], nTrades[i], sign[i])
-	}
-	return out
-}
-
-// medianDeltaMs computes median inter-trade time in milliseconds.
-func medianDeltaMs(ts []int64) float64 {
-	n := len(ts)
-	if n < 2 {
-		return 0
-	}
-	delta := make([]int64, n-1)
-	for i := 1; i < n; i++ {
-		dt := ts[i] - ts[i-1]
-		if dt <= 0 {
-			dt = 1
-		}
-		delta[i-1] = dt
-	}
-	sort.Slice(delta, func(i, j int) bool { return delta[i] < delta[j] })
-	mid := (n - 1) / 2
-	if (n-1)%2 == 1 {
-		return float64(delta[mid]+delta[mid+1]) * 0.5
-	}
-	return float64(delta[mid])
-}
-
-// --- Core Day Processing ----------------------------------------------------
-
-func processOFIDay(y, m, d int, horizons []int) []AlphaMetrics {
-	ts, px, qty, sign, nTrades, ok := loadDayTicks(y, m, d)
-	if !ok {
-		return nil
-	}
-	n := len(px)
-	if n == 0 {
-		return nil
-	}
-
-	// require enough data after warmup and max horizon
-	maxH := 0
-	for _, h := range horizons {
-		if h > maxH {
-			maxH = h
-		}
-	}
-	if n < OFIWarmupTrades+maxH+10 {
-		return nil
-	}
-
-	entryIdx := buildEntryIndex(ts, int64(OFIExecutionLagMS))
-
-	// precompute horizon returns
-	hMap := make(map[int]horizonData, len(horizons))
-	for _, h := range horizons {
-		hMap[h] = buildHorizonData(px, entryIdx, h, OFIWarmupTrades)
-	}
-
-	medianMs := medianDeltaMs(ts)
-	dateLabel := fmt.Sprintf("%04d-%02d-%02d", y, m, d)
-	var results []AlphaMetrics
-
-	for vIdx := range ofiVariants {
-		variant := &ofiVariants[vIdx]
-
-		sigSeries := computeSignalSeries(variant, px, qty, nTrades, sign)
-		if len(sigSeries) == 0 {
-			continue
-		}
-
-		if len(sigSeries) <= OFIWarmupTrades {
-			continue
-		}
-		sigForMetrics := sigSeries[OFIWarmupTrades:]
-
-		am := AlphaMetrics{
-			Label:   fmt.Sprintf("%s|%s|%s", Symbol, variant.ID, dateLabel),
-			NBars:   len(sigForMetrics),
-			Signal:  ComputeSignalMetrics(sigForMetrics),
-			Horizon: make(map[string]HorizonMetrics),
-		}
-
-		for _, h := range horizons {
-			hd := hMap[h]
-			var subSig, subRet []float64
-
-			for i := OFIWarmupTrades; i < n; i++ {
-				if !hd.valid[i] {
-					continue
-				}
-				subSig = append(subSig, sigSeries[i])
-				subRet = append(subRet, hd.ret[i])
-			}
-
-			if len(subSig) == 0 {
-				continue
-			}
-
-			hm := ComputeHorizonMetrics(subSig, subRet)
-			if hm.AlphaHalfLifeBars > 0 && medianMs > 0 {
-				hm.AlphaHalfLifeMs = hm.AlphaHalfLifeBars * medianMs
-			}
-			am.Horizon[fmt.Sprintf("%d", h)] = hm
-		}
-
-		// Only keep if we have at least one horizon with metrics
-		if len(am.Horizon) > 0 {
-			results = append(results, am)
-		}
-	}
-
-	return results
-}
-
-// --- Public Entry Point -----------------------------------------------------
-
-func runOFI() {
-	start := time.Now()
+// discoverTasks builds a list of (Y,M,D) that actually exist in the index files.
+// This avoids scheduling days that don't exist and reduces wasted I/O.
+func discoverTasks() []ofiTask {
 	root := filepath.Join(BaseDir, Symbol)
-
-	fmt.Printf("--- OFI LAB | Symbol: %s | Lag: %dms | Horizons: %v ---\n",
-		Symbol, OFIExecutionLagMS, OFIHorizons)
+	var tasks []ofiTask
 
 	years, err := os.ReadDir(root)
 	if err != nil {
-		fmt.Printf("[ofi] cannot read root %s: %v\n", root, err)
-		return
+		return tasks
 	}
 
-	var tasks []ofiTask
 	for _, yDir := range years {
 		if !yDir.IsDir() {
 			continue
 		}
 		y, err := strconv.Atoi(yDir.Name())
-		if err != nil {
+		if err != nil || y <= 0 {
 			continue
 		}
+
 		months, err := os.ReadDir(filepath.Join(root, yDir.Name()))
 		if err != nil {
 			continue
@@ -2198,71 +1067,1002 @@ func runOFI() {
 				continue
 			}
 			m, err := strconv.Atoi(mDir.Name())
+			if err != nil || m < 1 || m > 12 {
+				continue
+			}
+
+			idxPath := filepath.Join(root, yDir.Name(), mDir.Name(), "index.quantdev")
+			f, err := os.Open(idxPath)
 			if err != nil {
 				continue
 			}
-			idxPath := filepath.Join(root, yDir.Name(), mDir.Name(), "index.quantdev")
-			if _, err := os.Stat(idxPath); err != nil {
+
+			hdr := make([]byte, 16)
+			if _, err := io.ReadFull(f, hdr); err != nil {
+				f.Close()
 				continue
 			}
-			for d := 1; d <= 31; d++ {
-				tasks = append(tasks, ofiTask{Y: y, M: m, D: d})
+			// Optional: verify magic
+			if string(hdr[:4]) != IdxMagic {
+				f.Close()
+				continue
 			}
+
+			count := binary.LittleEndian.Uint64(hdr[8:])
+			row := make([]byte, 26)
+			for i := uint64(0); i < count; i++ {
+				if _, err := io.ReadFull(f, row); err != nil {
+					break
+				}
+				d := int(binary.LittleEndian.Uint16(row[0:]))
+				if d >= 1 && d <= 31 {
+					tasks = append(tasks, ofiTask{Y: y, M: m, D: d})
+				}
+			}
+			f.Close()
+		}
+	}
+	return tasks
+}
+
+type ofiTask struct{ Y, M, D int }
+
+// --- Model Logic & State Definitions ---
+
+type VariantDef struct {
+	ID    string
+	Model string
+	Cfg   interface{}
+}
+
+type SignalModel interface {
+	Update(row AggRow) float64
+}
+
+func createModel(v VariantDef) SignalModel {
+	switch v.Model {
+	case "Hawkes2Scale":
+		return NewHawkes2ScaleState(v.Cfg.(Hawkes2ScaleConfig))
+	case "HawkesAdaptive":
+		return NewHawkesAdaptiveState(v.Cfg.(HawkesAdaptiveConfig))
+	case "MultiEMA":
+		return NewMultiEMAState(v.Cfg.(MultiEMAConfig))
+	case "EMA":
+		return NewEMAState(v.Cfg.(EMAConfig))
+	}
+	return nil
+}
+
+// --- Shared Wrappers ---
+
+type VolEWMA struct {
+	Lambda  float64
+	VarEwma float64
+	LastPx  float64
+	HasLast bool
+}
+
+func (v *VolEWMA) Update(price float64) {
+	if !v.HasLast {
+		v.LastPx = price
+		v.HasLast = true
+		return
+	}
+	if price <= 0 {
+		return
+	}
+	r := math.Log(price / v.LastPx)
+	v.LastPx = price
+	v.VarEwma = v.Lambda*v.VarEwma + (1-v.Lambda)*r*r
+}
+
+func (v *VolEWMA) Sigma() float64 {
+	if v.VarEwma <= 0 {
+		return 0
+	}
+	return math.Sqrt(v.VarEwma)
+}
+
+type ZScoreEWMA struct {
+	Lambda float64
+	Mean   float64
+	Var    float64
+	Warmed bool
+}
+
+func (z *ZScoreEWMA) Update(x float64) float64 {
+	if !z.Warmed {
+		z.Mean = x
+		z.Var = 0
+		z.Warmed = true
+		return 0
+	}
+	mPrev := z.Mean
+	z.Mean = z.Lambda*z.Mean + (1-z.Lambda)*x
+	dx := x - mPrev
+	z.Var = z.Lambda*z.Var + (1-z.Lambda)*dx*dx
+	if z.Var <= 0 {
+		return 0
+	}
+	return (x - z.Mean) / math.Sqrt(z.Var)
+}
+
+func Squash(x, scale float64) float64 {
+	return math.Tanh(scale * x)
+}
+
+// --- Model A: Hawkes 2-Scale ---
+
+type Hawkes2ScaleConfig struct {
+	TauFast, TauSlow, MuBuy, MuSell            float64
+	A_pp_fast, A_pm_fast, A_mp_fast, A_mm_fast float64
+	A_pp_slow, A_pm_slow, A_mp_slow, A_mm_slow float64
+	D0, VolLambda, ZScoreLambda, SquashScale   float64
+}
+
+type Hawkes2ScaleState struct {
+	cfg                   Hawkes2ScaleConfig
+	lastTsMs              int64
+	eBuyFast, eSellFast   float64
+	eBuySlow, eSellSlow   float64
+	lambdaBuy, lambdaSell float64
+	vol                   VolEWMA
+	z                     ZScoreEWMA
+}
+
+func NewHawkes2ScaleState(cfg Hawkes2ScaleConfig) *Hawkes2ScaleState {
+	return &Hawkes2ScaleState{
+		cfg: cfg,
+		vol: VolEWMA{Lambda: cfg.VolLambda},
+		z:   ZScoreEWMA{Lambda: cfg.ZScoreLambda},
+	}
+}
+
+func (st *Hawkes2ScaleState) Update(row AggRow) float64 {
+	ts := row.TsMs
+	d := TradeDollar(row)
+	s := TradeSign(row)
+	px := TradePrice(row)
+
+	// dt in seconds
+	var dtSec float64
+	if st.lastTsMs == 0 {
+		st.lastTsMs = ts
+		dtSec = 0
+	} else {
+		dtSec = float64(ts-st.lastTsMs) / 1000.0
+		if dtSec < 0 {
+			dtSec = 0
+		}
+		st.lastTsMs = ts
+	}
+
+	// decay excitations
+	if dtSec > 0 {
+		df := math.Exp((-1.0 / st.cfg.TauFast) * dtSec)
+		ds := math.Exp((-1.0 / st.cfg.TauSlow) * dtSec)
+		st.eBuyFast *= df
+		st.eSellFast *= df
+		st.eBuySlow *= ds
+		st.eSellSlow *= ds
+	}
+
+	// log-saturated mark
+	mark := 0.0
+	if d > 0 && st.cfg.D0 > 0 {
+		mark = math.Log(1.0 + d/st.cfg.D0)
+	}
+
+	// add excitation
+	if s > 0 {
+		st.eBuyFast += mark
+		st.eBuySlow += mark
+	} else {
+		st.eSellFast += mark
+		st.eSellSlow += mark
+	}
+
+	// intensities
+	buy := st.cfg.MuBuy +
+		(st.cfg.A_pp_fast*st.eBuyFast + st.cfg.A_pm_fast*st.eSellFast) +
+		(st.cfg.A_pp_slow*st.eBuySlow + st.cfg.A_pm_slow*st.eSellSlow)
+
+	sell := st.cfg.MuSell +
+		(st.cfg.A_mp_fast*st.eBuyFast + st.cfg.A_mm_fast*st.eSellFast) +
+		(st.cfg.A_mp_slow*st.eBuySlow + st.cfg.A_mm_slow*st.eSellSlow)
+
+	if buy < 0 {
+		buy = 0
+	}
+	if sell < 0 {
+		sell = 0
+	}
+
+	st.lambdaBuy = buy
+	st.lambdaSell = sell
+
+	imb := 0.0
+	if den := buy + sell; den > 1e-12 {
+		imb = (buy - sell) / den
+	}
+
+	// vol & z
+	st.vol.Update(px)
+	sigma := st.vol.Sigma()
+	if sigma <= 0 {
+		sigma = 1
+	}
+	return Squash(st.z.Update(imb/sigma), st.cfg.SquashScale)
+}
+
+// --- Model B: Hawkes Adaptive ---
+
+type HawkesAdaptiveConfig struct {
+	HawkesCfg                        Hawkes2ScaleConfig
+	ActivityLambda, ActMid, ActSlope float64
+}
+
+type HawkesAdaptiveState struct {
+	base                                         Hawkes2ScaleConfig
+	lastTsMs                                     int64
+	eBuyFast, eSellFast                          float64
+	eBuySlow, eSellSlow                          float64
+	actLambda, actEWMA, actMid, actSlope, squash float64
+	vol                                          VolEWMA
+	z                                            ZScoreEWMA
+}
+
+func NewHawkesAdaptiveState(cfg HawkesAdaptiveConfig) *HawkesAdaptiveState {
+	return &HawkesAdaptiveState{
+		base:      cfg.HawkesCfg,
+		actLambda: cfg.ActivityLambda,
+		actMid:    cfg.ActMid,
+		actSlope:  cfg.ActSlope,
+		squash:    cfg.HawkesCfg.SquashScale,
+		vol:       VolEWMA{Lambda: cfg.HawkesCfg.VolLambda},
+		z:         ZScoreEWMA{Lambda: cfg.HawkesCfg.ZScoreLambda},
+	}
+}
+
+func (st *HawkesAdaptiveState) Update(row AggRow) float64 {
+	ts := row.TsMs
+	d := TradeDollar(row)
+	s := TradeSign(row)
+	px := TradePrice(row)
+
+	var dtSec float64
+	if st.lastTsMs == 0 {
+		st.lastTsMs = ts
+		dtSec = 0
+	} else {
+		dtSec = float64(ts-st.lastTsMs) / 1000.0
+		if dtSec < 0 {
+			dtSec = 0
+		}
+		st.lastTsMs = ts
+	}
+
+	// activity EWMA and decay
+	if dtSec > 0 {
+		st.actEWMA = st.actLambda*st.actEWMA + (1-st.actLambda)*(1.0/dtSec)
+		df := math.Exp((-1.0 / st.base.TauFast) * dtSec)
+		ds := math.Exp((-1.0 / st.base.TauSlow) * dtSec)
+		st.eBuyFast *= df
+		st.eSellFast *= df
+		st.eBuySlow *= ds
+		st.eSellSlow *= ds
+	}
+
+	// mark
+	mark := 0.0
+	if d > 0 && st.base.D0 > 0 {
+		mark = math.Log(1.0 + d/st.base.D0)
+	}
+
+	if s > 0 {
+		st.eBuyFast += mark
+		st.eBuySlow += mark
+	} else {
+		st.eSellFast += mark
+		st.eSellSlow += mark
+	}
+
+	// fast kernel intensities
+	bf := st.base.MuBuy + st.base.A_pp_fast*st.eBuyFast + st.base.A_pm_fast*st.eSellFast
+	sf := st.base.MuSell + st.base.A_mp_fast*st.eBuyFast + st.base.A_mm_fast*st.eSellFast
+
+	// slow kernel intensities
+	bs := st.base.MuBuy + st.base.A_pp_slow*st.eBuySlow + st.base.A_pm_slow*st.eSellSlow
+	ss := st.base.MuSell + st.base.A_mp_slow*st.eBuySlow + st.base.A_mm_slow*st.eSellSlow
+
+	// activity-based slow weight (higher activity -> lower slow weight)
+	wSlow := 0.5
+	if st.actEWMA > 0 {
+		x := (math.Log(st.actEWMA+1e-9) - math.Log(st.actMid+1e-9)) * st.actSlope
+		wSlow = 1.0 / (1.0 + math.Exp(x))
+	}
+	if wSlow < 0 {
+		wSlow = 0
+	}
+	if wSlow > 1 {
+		wSlow = 1
+	}
+	wFast := 1.0 - wSlow
+
+	buy := wFast*bf + wSlow*bs
+	sell := wFast*sf + wSlow*ss
+	if buy < 0 {
+		buy = 0
+	}
+	if sell < 0 {
+		sell = 0
+	}
+
+	imb := 0.0
+	if den := buy + sell; den > 1e-12 {
+		imb = (buy - sell) / den
+	}
+
+	st.vol.Update(px)
+	sigma := st.vol.Sigma()
+	if sigma <= 0 {
+		sigma = 1
+	}
+
+	return Squash(st.z.Update(imb/sigma), st.squash)
+}
+
+// --- Model C: Multi-EMA Power-Law ---
+
+type MultiEMAConfig struct {
+	TauSec, Weights                          []float64
+	D0, VolLambda, ZScoreLambda, SquashScale float64
+}
+
+type MultiEMAState struct {
+	cfg      MultiEMAConfig
+	lastTsMs int64
+	ema      []float64
+	vol      VolEWMA
+	z        ZScoreEWMA
+}
+
+func NewMultiEMAState(cfg MultiEMAConfig) *MultiEMAState {
+	return &MultiEMAState{
+		cfg: cfg,
+		ema: make([]float64, len(cfg.TauSec)),
+		vol: VolEWMA{Lambda: cfg.VolLambda},
+		z:   ZScoreEWMA{Lambda: cfg.ZScoreLambda},
+	}
+}
+
+func (st *MultiEMAState) Update(row AggRow) float64 {
+	ts := row.TsMs
+	d := TradeDollar(row)
+	s := TradeSign(row)
+	px := TradePrice(row)
+
+	var dtSec float64
+	if st.lastTsMs == 0 {
+		st.lastTsMs = ts
+		dtSec = 0
+	} else {
+		dtSec = float64(ts-st.lastTsMs) / 1000.0
+		if dtSec < 0 {
+			dtSec = 0
+		}
+		st.lastTsMs = ts
+	}
+
+	mark := 0.0
+	if d > 0 && st.cfg.D0 > 0 {
+		mark = math.Log(1.0 + d/st.cfg.D0)
+	}
+	x := s * mark
+
+	for j, tau := range st.cfg.TauSec {
+		if tau <= 0 {
+			continue
+		}
+		if dtSec > 0 {
+			lambda := math.Exp(-dtSec / tau)
+			st.ema[j] = lambda*st.ema[j] + (1-lambda)*x
+		} else {
+			st.ema[j] = x
 		}
 	}
 
-	fmt.Printf("[ofi] Scanning %d potential (year,month,day) slices using %d threads...\n",
-		len(tasks), CPUThreads)
+	imb := 0.0
+	for j, w := range st.cfg.Weights {
+		imb += w * st.ema[j]
+	}
 
-	jobs := make(chan ofiTask, len(tasks))
-	results := make(chan []AlphaMetrics, len(tasks))
+	st.vol.Update(px)
+	sigma := st.vol.Sigma()
+	if sigma <= 0 {
+		sigma = 1
+	}
+
+	return Squash(st.z.Update(imb/sigma), st.cfg.SquashScale)
+}
+
+// --- Model D: EMA Baseline ---
+
+type EMAConfig struct {
+	TauSec, D0, VolLambda, ZScoreLambda, SquashScale float64
+}
+
+type EMAState struct {
+	cfg      EMAConfig
+	lastTsMs int64
+	ema      float64
+	vol      VolEWMA
+	z        ZScoreEWMA
+}
+
+func NewEMAState(cfg EMAConfig) *EMAState {
+	return &EMAState{
+		cfg: cfg,
+		vol: VolEWMA{Lambda: cfg.VolLambda},
+		z:   ZScoreEWMA{Lambda: cfg.ZScoreLambda},
+	}
+}
+
+func (st *EMAState) Update(row AggRow) float64 {
+	ts := row.TsMs
+	d := TradeDollar(row)
+	s := TradeSign(row)
+	px := TradePrice(row)
+
+	var dtSec float64
+	if st.lastTsMs == 0 {
+		st.lastTsMs = ts
+		dtSec = 0
+	} else {
+		dtSec = float64(ts-st.lastTsMs) / 1000.0
+		if dtSec < 0 {
+			dtSec = 0
+		}
+		st.lastTsMs = ts
+	}
+
+	mark := 0.0
+	if d > 0 && st.cfg.D0 > 0 {
+		mark = math.Log(1.0 + d/st.cfg.D0)
+	}
+	x := s * mark
+
+	if dtSec > 0 && st.cfg.TauSec > 0 {
+		lambda := math.Exp(-dtSec / st.cfg.TauSec)
+		st.ema = lambda*st.ema + (1-lambda)*x
+	} else {
+		st.ema = x
+	}
+
+	st.vol.Update(px)
+	sigma := st.vol.Sigma()
+	if sigma <= 0 {
+		sigma = 1
+	}
+
+	return Squash(st.z.Update(st.ema/sigma), st.cfg.SquashScale)
+}
+```
+
+// --- End File: ofibuild.go ---
+
+// --- File: ofistudy.go ---
+
+```go
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"text/tabwriter"
+	"time"
+)
+
+// --- Study Config ---
+
+const (
+	OOSDateStr   = "2024-01-01"
+	StudyThreads = 24         // Saturate all 24 logical cores on Ryzen 9 7900X
+	StudyMaxRows = 10_000_000 // Per-thread default row budget for buffers
+)
+
+// TimeHorizonsSec: The horizons to test.
+var TimeHorizonsSec = []int{10, 30, 60, 180, 300}
+
+var oosBoundaryYMD int
+
+func init() {
+	oosBoundaryYMD = parseOOSBoundary(OOSDateStr)
+}
+
+// --- Data Structures ---
+
+// Accumulator aggregates stats across days for a single horizon.
+type Accumulator struct {
+	Days      int
+	SumIC     float64
+	SumSharpe float64
+	SumHit    float64
+	SumBE     float64
+}
+
+// DayResult holds one day's stats for ALL variants and ALL horizons.
+// Map key: VariantID -> []MetricStats (index corresponds to TimeHorizonsSec)
+type DayResult struct {
+	Stats map[string][]MetricStats
+	YMD   int
+}
+
+// --- Main Runner ---
+
+func runStudy() {
+	startT := time.Now()
+	featRoot := filepath.Join(BaseDir, "features", Symbol)
+
+	// 1. Discover Variants
+	entries, err := os.ReadDir(featRoot)
+	if err != nil {
+		fmt.Printf("[err] reading feature dir: %v\n", err)
+		return
+	}
+	var variants []string
+	for _, e := range entries {
+		if e.IsDir() {
+			variants = append(variants, e.Name())
+		}
+	}
+	slices.Sort(variants)
+
+	if len(variants) == 0 {
+		fmt.Println("[warn] No variants found.")
+		return
+	}
+
+	fmt.Printf("--- OFI STUDY | %s | %d Variants | Split: %s ---\n", Symbol, len(variants), OOSDateStr)
+	fmt.Printf("[arch] Optimized Day-Parallel Pipeline (Ryzen 7900X)\n")
+
+	// 2. Discover Common Days (intersection of Raw Data and Features)
+	tasks := discoverStudyDays(filepath.Join(featRoot, variants[0]))
+	if len(tasks) == 0 {
+		fmt.Println("[warn] No .bin days found for first variant.")
+		return
+	}
+
+	workerCount := StudyThreads
+	if workerCount > CPUThreads {
+		workerCount = CPUThreads
+	}
+	fmt.Printf("[job] Processing %d days using %d threads.\n", len(tasks), workerCount)
+
+	// 3. Worker Pool (Day-Parallel)
+	resultsChan := make(chan DayResult, len(tasks))
+	jobsChan := make(chan int, len(tasks))
 	var wg sync.WaitGroup
 
-	for i := 0; i < CPUThreads; i++ {
+	// Accumulators: Variant -> Horizon -> Accumulator
+	isAcc := make(map[string][]Accumulator)
+	oosAcc := make(map[string][]Accumulator)
+
+	for _, v := range variants {
+		isAcc[v] = make([]Accumulator, len(TimeHorizonsSec))
+		oosAcc[v] = make([]Accumulator, len(TimeHorizonsSec))
+	}
+
+	// Spin up workers
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for t := range jobs {
-				ms := processOFIDay(t.Y, t.M, t.D, OFIHorizons)
-				if len(ms) > 0 {
-					results <- ms
-				}
+
+			// --- Thread-Local Buffers (reused across days) ---
+			maxRows := StudyMaxRows
+
+			prices := make([]float64, maxRows)
+			times := make([]int64, maxRows)
+			sigBuf := make([]float64, maxRows)
+
+			// Scratch buffers for per-horizon calculations
+			scratchSig := make([]float64, 0, maxRows)
+			scratchRet := make([]float64, 0, maxRows)
+
+			// File read buffer (reused for signal files)
+			fileBuf := make([]byte, maxRows*8)
+
+			for idx := range jobsChan {
+				dayInt := tasks[idx]
+				res := processStudyDay(
+					dayInt, variants, featRoot,
+					prices, times, sigBuf, fileBuf,
+					&scratchSig, &scratchRet,
+				)
+				resultsChan <- res
 			}
 		}()
 	}
 
-	for _, t := range tasks {
-		jobs <- t
+	// Enqueue jobs
+	for i := range tasks {
+		jobsChan <- i
 	}
-	close(jobs)
-	wg.Wait()
-	close(results)
+	close(jobsChan)
 
-	var all []AlphaMetrics
-	for ms := range results {
-		all = append(all, ms...)
+	// Close results channel when workers finish
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// 4. Aggregation (Main Thread)
+	for res := range resultsChan {
+		if len(res.Stats) == 0 {
+			continue
+		}
+		isOOS := res.YMD >= oosBoundaryYMD
+
+		for v, hStats := range res.Stats {
+			for hIdx, stat := range hStats {
+				if stat.Count == 0 {
+					continue
+				}
+
+				var target []Accumulator
+				if isOOS {
+					target = oosAcc[v]
+				} else {
+					target = isAcc[v]
+				}
+
+				target[hIdx].Days++
+				target[hIdx].SumIC += stat.ICPearson
+				target[hIdx].SumSharpe += stat.SharpeAnnual
+				target[hIdx].SumHit += stat.HitRate
+				target[hIdx].SumBE += stat.BreakevenBps
+			}
+		}
 	}
 
-	if len(all) == 0 {
-		fmt.Println("[ofi] No metrics produced.")
-		return
+	// 5. Reporting
+	fmt.Println()
+	for hIdx, sec := range TimeHorizonsSec {
+		printHorizonTable(sec, variants, isAcc, oosAcc, hIdx)
+		fmt.Println()
 	}
 
-	// Deterministic ordering by label
-	sort.Slice(all, func(i, j int) bool { return all[i].Label < all[j].Label })
+	fmt.Printf("[study] Complete in %s\n", time.Since(startT))
+}
 
-	outPath := filepath.Join(BaseDir, "reports", fmt.Sprintf("ofi_%s.json", Symbol))
-	if err := SaveAlphaMetrics(outPath, all); err != nil {
-		fmt.Printf("[ofi] error saving metrics: %v\n", err)
+// processStudyDay loads Raw Data ONCE, then iterates variants.
+func processStudyDay(
+	dayInt int,
+	variants []string,
+	featRoot string,
+	prices []float64,
+	times []int64,
+	sigBuf []float64,
+	fileBuf []byte,
+	scratchSig, scratchRet *[]float64,
+) DayResult {
+	y := dayInt / 10000
+	m := (dayInt % 10000) / 100
+	d := dayInt % 100
+
+	res := DayResult{
+		YMD:   dayInt,
+		Stats: make(map[string][]MetricStats),
+	}
+
+	// 1. Load Raw Data (Expensive ZLIB op - Done ONCE)
+	rawBytes, rowCount, ok := loadRawDay(y, m, d)
+	if !ok || rowCount == 0 {
+		return res
+	}
+
+	n := int(rowCount)
+
+	// --- CRITICAL FIX: Grow buffers instead of dropping high-vol days ---
+	if n > cap(prices) {
+		newCap := n + n/4 // 25% headroom
+		prices = make([]float64, newCap)
+		times = make([]int64, newCap)
+		sigBuf = make([]float64, newCap)
+	}
+	if n > cap(*scratchSig) {
+		*scratchSig = make([]float64, 0, n+n/4)
+	}
+	if n > cap(*scratchRet) {
+		*scratchRet = make([]float64, 0, n+n/4)
+	}
+	if n*8 > cap(fileBuf) {
+		fileBuf = make([]byte, n*8+n*2)
+	}
+
+	// Reslice working views to exactly n rows
+	prices = prices[:n]
+	times = times[:n]
+	sigBuf = sigBuf[:n]
+
+	// 2. Parse Raw Data (Vectorized parsing)
+	for i := 0; i < n; i++ {
+		off := i * RowSize // RowSize=48 defined in common.go
+		// Prices at offset 8 (uint64), Times at offset 38 (uint64)
+		pBits := binary.LittleEndian.Uint64(rawBytes[off+8:])
+		tBits := binary.LittleEndian.Uint64(rawBytes[off+38:])
+
+		prices[i] = float64(pBits) // PxScale is constant; relative moves are what matter
+		times[i] = int64(tBits)
+	}
+
+	// 3. Iterate Variants
+	dStr := fmt.Sprintf("%04d%02d%02d", y, m, d)
+
+	for _, v := range variants {
+		sigPath := filepath.Join(featRoot, v, dStr+".bin")
+
+		// Fast Load Signals
+		loadedSigs, ok := fastLoadFloats(sigPath, fileBuf, sigBuf)
+		if !ok || len(loadedSigs) != n {
+			continue
+		}
+
+		// Calc Stats for all horizons
+		statsList := make([]MetricStats, len(TimeHorizonsSec))
+		for hIdx, sec := range TimeHorizonsSec {
+			statsList[hIdx] = calcDailyStatsTimePrepared(
+				loadedSigs, prices, times, sec*1000, scratchSig, scratchRet,
+			)
+		}
+		res.Stats[v] = statsList
+	}
+
+	return res
+}
+
+// fastLoadFloats reads binary floats into a pre-allocated buffer to reduce GC.
+func fastLoadFloats(path string, fileBuf []byte, outBuf []float64) ([]float64, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+
+	// Stat to get size
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, false
+	}
+	size := int(fi.Size())
+	if size <= 0 || size%8 != 0 {
+		return nil, false
+	}
+	count := size / 8
+
+	if count > cap(outBuf) {
+		// Should be extremely rare if StudyMaxRows is set appropriately.
+		outBuf = make([]float64, count)
 	} else {
-		fmt.Println("[ofi] metrics saved:", outPath)
+		outBuf = outBuf[:count]
 	}
 
-	fmt.Printf("[ofi] total records: %d | elapsed: %s\n", len(all), time.Since(start))
+	// Ensure fileBuf is large enough
+	if cap(fileBuf) < size {
+		fileBuf = make([]byte, size)
+	}
+	fileBuf = fileBuf[:size]
+
+	// Single Syscall Read using io.ReadFull
+	if _, err := io.ReadFull(f, fileBuf); err != nil {
+		return nil, false
+	}
+
+	// Binary Decode
+	for i := 0; i < count; i++ {
+		bits := binary.LittleEndian.Uint64(fileBuf[i*8:])
+		outBuf[i] = math.Float64frombits(bits)
+	}
+
+	return outBuf, true
+}
+
+// calcDailyStatsTimePrepared matches input logic but uses pointers for scratch buffers.
+func calcDailyStatsTimePrepared(
+	sig []float64,
+	prices []float64,
+	times []int64,
+	horizonMs int,
+	scratchSig *[]float64,
+	scratchRet *[]float64,
+) MetricStats {
+	n := len(sig)
+	if n < 200 || len(prices) != n || len(times) != n {
+		return MetricStats{}
+	}
+
+	// Reset scratch length, keep capacity
+	vSig := (*scratchSig)[:0]
+	vRet := (*scratchRet)[:0]
+
+	j := 0
+	hVal := int64(horizonMs)
+
+	for i := 0; i < n; i++ {
+		pStart := prices[i]
+		s := sig[i]
+
+		// Fast reject: invalid price or zero signal
+		if pStart <= 0 || s == 0 {
+			continue
+		}
+
+		t0 := times[i]
+		target := t0 + hVal
+		if target <= t0 {
+			continue
+		}
+
+		// Ensure j is strictly forward
+		if j < i+1 {
+			j = i + 1
+		}
+		for j < n && times[j] < target {
+			j++
+		}
+		if j >= n {
+			break // no more future horizon points
+		}
+
+		pEnd := prices[j]
+		if pEnd <= 0 {
+			continue
+		}
+
+		// simple return
+		r := (pEnd - pStart) / pStart
+
+		vSig = append(vSig, s)
+		vRet = append(vRet, r)
+	}
+
+	*scratchSig = vSig
+	*scratchRet = vRet
+
+	if len(vSig) < 2 {
+		return MetricStats{}
+	}
+
+	return ComputeStats(vSig, vRet)
+}
+
+// --- Helpers ---
+
+func discoverStudyDays(vDir string) []int {
+	var days []int
+	files, _ := os.ReadDir(vDir)
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".bin") {
+			name := strings.TrimSuffix(f.Name(), ".bin")
+			if len(name) == 8 {
+				val := fastAtoi(name)
+				if val > 0 {
+					days = append(days, val)
+				}
+			}
+		}
+	}
+	sort.Ints(days)
+	return days
+}
+
+func printHorizonTable(
+	sec int,
+	variants []string,
+	isAcc, oosAcc map[string][]Accumulator,
+	hIdx int,
+) {
+	// Build results list for sorting
+	type row struct {
+		Name string
+		IS   Accumulator
+		OOS  Accumulator
+	}
+	var rows []row
+
+	for _, v := range variants {
+		rows = append(rows, row{
+			Name: v,
+			IS:   isAcc[v][hIdx],
+			OOS:  oosAcc[v][hIdx],
+		})
+	}
+
+	// Sort by OOS Sharpe Descending
+	slices.SortFunc(rows, func(a, b row) int {
+		sa := 0.0
+		if a.OOS.Days > 0 {
+			sa = a.OOS.SumSharpe / float64(a.OOS.Days)
+		}
+		sb := 0.0
+		if b.OOS.Days > 0 {
+			sb = b.OOS.SumSharpe / float64(b.OOS.Days)
+		}
+		if sa > sb {
+			return -1
+		}
+		if sa < sb {
+			return 1
+		}
+		return 0
+	})
+
+	fmt.Printf("== Horizon %d seconds ==\n", sec)
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "VARIANT\tIS_DAYS\tOOS_DAYS\tIS_IC\tOOS_IC\tIS_SR\tOOS_SR\tIS_HIT\tOOS_HIT\tIS_BE\tOOS_BE")
+	fmt.Fprintln(w, "-------\t-------\t--------\t-----\t------\t-----\t------\t------\t-------\t-----\t------")
+
+	for _, r := range rows {
+		var isIC, isSR, isHit, isBE float64
+		var oosIC, oosSR, oosHit, oosBE float64
+
+		if r.IS.Days > 0 {
+			div := float64(r.IS.Days)
+			isIC = r.IS.SumIC / div
+			isSR = r.IS.SumSharpe / div
+			isHit = (r.IS.SumHit / div) * 100
+			isBE = r.IS.SumBE / div
+		}
+		if r.OOS.Days > 0 {
+			div := float64(r.OOS.Days)
+			oosIC = r.OOS.SumIC / div
+			oosSR = r.OOS.SumSharpe / div
+			oosHit = (r.OOS.SumHit / div) * 100
+			oosBE = r.OOS.SumBE / div
+		}
+
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.4f\t%.4f\t%.2f\t%.2f\t%.1f%%\t%.1f%%\t%.1f\t%.1f\n",
+			r.Name, r.IS.Days, r.OOS.Days,
+			isIC, oosIC, isSR, oosSR, isHit, oosHit, isBE, oosBE,
+		)
+	}
+	_ = w.Flush()
+}
+
+func parseOOSBoundary(dateStr string) int {
+	if len(dateStr) < 10 {
+		return 0
+	}
+	y := fastAtoi(dateStr[0:4])
+	m := fastAtoi(dateStr[5:7])
+	d := fastAtoi(dateStr[8:10])
+	return y*10000 + m*100 + d
+}
+
+// fastAtoi converts an ASCII digit string (no sign) to int.
+func fastAtoi(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 ```
 
-// --- End File: ofi.go ---
+// --- End File: ofistudy.go ---
 
 // --- File: sanity.go ---
 
@@ -2415,7 +2215,7 @@ func validateMonth(dir string) {
 			continue
 		}
 
-		// Validate header magic and version minimally
+		// Validate header magic
 		if string(aggBlob[:4]) != AggMagic {
 			issues++
 			continue
@@ -2436,196 +2236,4 @@ func validateMonth(dir string) {
 ```
 
 // --- End File: sanity.go ---
-
-// --- File: sum.go ---
-
-```go
-package main
-
-import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
-	"text/tabwriter"
-	"time"
-)
-
-const (
-	// OFI report produced by runOFI()
-	OFIReportPath = "data/reports/ofi_BTCUSDT.json"
-
-	// Target horizon key inside AlphaMetrics.Horizon (as set in ofi.go)
-	TargetHz = "50"
-)
-
-// Aggregation container per OFI variant
-type ofiAgg struct {
-	Variant   string
-	Days      int
-	TotalBars int64
-	StartDate string
-	EndDate   string
-
-	SumIC       float64
-	SumHAC      float64
-	SumSharpe   float64
-	SumProbSR   float64
-	SumBE       float64
-	SumFill     float64
-	SumHit      float64
-	SumHalfBars float64
-	SumHalfMs   float64
-	PosICDays   int
-	PosHACDays  int
-}
-
-// runSum summarizes OFI metrics across all days and variants at TargetHz.
-func runSum() {
-	path := filepath.FromSlash(OFIReportPath)
-	f, err := os.Open(path)
-	if err != nil {
-		fmt.Printf("Error opening OFI report: %v\n", err)
-		return
-	}
-	defer f.Close()
-
-	startT := time.Now()
-
-	var entries []AlphaMetrics
-	dec := json.NewDecoder(f)
-	if err := dec.Decode(&entries); err != nil {
-		fmt.Printf("Error decoding OFI report JSON: %v\n", err)
-		return
-	}
-	if len(entries) == 0 {
-		fmt.Println("No OFI metrics found.")
-		return
-	}
-
-	// Aggregate per variant
-	aggMap := make(map[string]*ofiAgg)
-
-	for _, e := range entries {
-		// label format: "SYMBOL|VARIANT|YYYY-MM-DD"
-		parts := strings.Split(e.Label, "|")
-		if len(parts) < 3 {
-			continue
-		}
-		variant := parts[1]
-		date := parts[2]
-
-		h, ok := e.Horizon[TargetHz]
-		if !ok {
-			continue
-		}
-
-		a, ok := aggMap[variant]
-		if !ok {
-			a = &ofiAgg{Variant: variant}
-			aggMap[variant] = a
-		}
-
-		a.Days++
-		a.TotalBars += int64(e.NBars)
-
-		if a.StartDate == "" || date < a.StartDate {
-			a.StartDate = date
-		}
-		if a.EndDate == "" || date > a.EndDate {
-			a.EndDate = date
-		}
-
-		a.SumIC += h.ICPearson
-		a.SumHAC += h.HACSharpe
-		a.SumSharpe += h.TheoreticalSharpe
-		a.SumProbSR += h.ProbSharpeRatio
-		a.SumBE += h.BreakevenBps
-		a.SumFill += h.FillRate
-		a.SumHit += h.DirectionalHit
-		a.SumHalfBars += h.AlphaHalfLifeBars
-		a.SumHalfMs += h.AlphaHalfLifeMs
-
-		if h.ICPearson > 0 {
-			a.PosICDays++
-		}
-		if h.HACSharpe > 0 {
-			a.PosHACDays++
-		}
-	}
-
-	if len(aggMap) == 0 {
-		fmt.Println("No valid OFI metrics at target horizon.")
-		return
-	}
-
-	// Convert to slice and rank by mean HAC Sharpe
-	var aggs []*ofiAgg
-	for _, a := range aggMap {
-		aggs = append(aggs, a)
-	}
-
-	sort.Slice(aggs, func(i, j int) bool {
-		di := float64(aggs[i].Days)
-		dj := float64(aggs[j].Days)
-		if di == 0 || dj == 0 {
-			return aggs[i].Variant < aggs[j].Variant
-		}
-		return (aggs[i].SumHAC / di) > (aggs[j].SumHAC / dj)
-	})
-
-	// Output summary
-	fmt.Printf("\n--- OFI VARIANT SUMMARY | %s | Horizon: %s ticks ---\n",
-		filepath.Base(path), TargetHz)
-	fmt.Printf("Processing Time: %s\n\n", time.Since(startT))
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-
-	// Header
-	fmt.Fprintf(w, "VARIANT\tDAYS\tBARS\tMEAN_IC\tHIT_RATE\tMEAN_HAC\tMEAN_SR\tBREAKEVEN_BPS\tFILL_RATE\tHALF_LIFE_MS\tPOS_IC%%\tPOS_HAC%%\tPERIOD\n")
-	fmt.Fprintf(w, "------\t----\t----\t-------\t--------\t--------\t-------\t-------------\t---------\t------------\t-------\t--------\t------\n")
-
-	for _, a := range aggs {
-		if a.Days == 0 {
-			continue
-		}
-		n := float64(a.Days)
-
-		meanIC := a.SumIC / n
-		meanHAC := a.SumHAC / n
-		meanSR := a.SumSharpe / n
-		meanBE := a.SumBE / n
-		meanFill := (a.SumFill / n) * 100.0
-		meanHit := (a.SumHit / n) * 100.0
-		meanHLms := a.SumHalfMs / n
-
-		posICPct := 100.0 * float64(a.PosICDays) / n
-		posHACPct := 100.0 * float64(a.PosHACDays) / n
-
-		fmt.Fprintf(w, "%s\t%d\t%d\t%.4f\t%.1f%%\t%.2f\t%.2f\t%.2f\t%.1f%%\t%.1f\t%.1f%%\t%.1f%%\t%s→%s\n",
-			a.Variant,
-			a.Days,
-			a.TotalBars,
-			meanIC,
-			meanHit,
-			meanHAC,
-			meanSR,
-			meanBE,
-			meanFill,
-			meanHLms,
-			posICPct,
-			posHACPct,
-			a.StartDate,
-			a.EndDate,
-		)
-	}
-
-	w.Flush()
-	fmt.Println("")
-}
-```
-
-// --- End File: sum.go ---
 

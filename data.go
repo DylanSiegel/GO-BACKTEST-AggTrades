@@ -73,7 +73,6 @@ func runData() {
 	}
 
 	end := time.Now().UTC().AddDate(0, 0, -1)
-
 	if end.Before(start) {
 		fmt.Println("Nothing to do.")
 		return
