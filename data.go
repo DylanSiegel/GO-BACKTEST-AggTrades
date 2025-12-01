@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -40,13 +39,11 @@ var (
 )
 
 func init() {
-	// High-throughput Transport
+	// High-throughput Transport (no TLS hacks)
 	tr := &http.Transport{
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
-		DisableKeepAlives:   false,
 	}
 	httpClient = &http.Client{
 		Transport: tr,
@@ -54,7 +51,7 @@ func init() {
 	}
 }
 
-// runData is called by shared.go -> main()
+// runData is called by main()
 func runData() {
 	// Graceful Shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -69,7 +66,12 @@ func runData() {
 
 	fmt.Printf("--- data.go (Ryzen 7900X Optimized) | Symbol: %s ---\n", Symbol)
 
-	start, _ := time.Parse("2006-01-02", FallbackDt)
+	start, err := time.Parse("2006-01-02", FallbackDt)
+	if err != nil {
+		fmt.Printf("[fatal] invalid FallbackDt %q: %v\n", FallbackDt, err)
+		return
+	}
+
 	end := time.Now().UTC().AddDate(0, 0, -1)
 
 	if end.Before(start) {
@@ -99,7 +101,7 @@ func runData() {
 				stopMu.Lock()
 				if stopEvent {
 					stopMu.Unlock()
-					break
+					return
 				}
 				stopMu.Unlock()
 
@@ -118,7 +120,7 @@ func runData() {
 	// Stats
 	stats := make(map[string]int)
 	for r := range results {
-		key := strings.Split(r, " ")[0]
+		key := strings.SplitN(r, " ", 2)[0]
 		stats[key]++
 	}
 	fmt.Printf("\n[done] %v\n", stats)
@@ -132,8 +134,7 @@ func processDay(d time.Time) string {
 	idxPath := filepath.Join(dirPath, "index.quantdev")
 	dataPath := filepath.Join(dirPath, "data.quantdev")
 
-	// 1. Get Directory Lock (Crucial Fix for IO Race)
-	// We allow concurrent DL/Parse, but serialize Index/Data checks & writes per month.
+	// 1. Get Directory Lock (serialize Index/Data per month)
 	muAny, _ := dirLocks.LoadOrStore(dirPath, &sync.Mutex{})
 	mu := muAny.(*sync.Mutex)
 
@@ -169,9 +170,18 @@ func processDay(d time.Time) string {
 
 	// 5. Compress (Concurrent / High CPU)
 	var b bytes.Buffer
-	w, _ := zlib.NewWriterLevel(&b, zlib.BestSpeed) // Level 1 is fastest, sufficient for numbers
-	w.Write(aggBlob)
-	w.Close()
+	const zLevel = zlib.BestSpeed
+	w, err := zlib.NewWriterLevel(&b, zLevel)
+	if err != nil {
+		return "error_zlib"
+	}
+	if _, err := w.Write(aggBlob); err != nil {
+		w.Close()
+		return "error_zlib_write"
+	}
+	if err := w.Close(); err != nil {
+		return "error_zlib_close"
+	}
 	compBlob := b.Bytes()
 
 	// 6. Checksum (Concurrent)
@@ -196,31 +206,41 @@ func processDay(d time.Time) string {
 	if err != nil {
 		return "error_io"
 	}
-
-	stat, _ := fData.Stat()
+	stat, err := fData.Stat()
+	if err != nil {
+		fData.Close()
+		return "error_stat"
+	}
 	offset := stat.Size()
 
 	if _, err := fData.Write(compBlob); err != nil {
 		fData.Close()
 		return "error_write"
 	}
-	fData.Close() // Close immediately to flush
+	if err := fData.Close(); err != nil {
+		return "error_close_data"
+	}
 
-	// Append Index
+	// Append / Init Index
 	fIdx, err := os.OpenFile(idxPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return "error_idx"
 	}
 	defer fIdx.Close()
 
-	idxStat, _ := fIdx.Stat()
+	idxStat, err := fIdx.Stat()
+	if err != nil {
+		return "error_idx_stat"
+	}
 	if idxStat.Size() == 0 {
 		// Init Index Header
 		hdr := make([]byte, 16)
 		copy(hdr[0:], IdxMagic)
 		binary.LittleEndian.PutUint32(hdr[4:], uint32(IdxVersion))
 		binary.LittleEndian.PutUint64(hdr[8:], 0) // Count = 0
-		fIdx.Write(hdr)
+		if _, err := fIdx.Write(hdr); err != nil {
+			return "error_idx_hdr"
+		}
 	}
 
 	// Index Row: Day(2), Offset(8), Length(8), Checksum(8) = 26 bytes
@@ -238,11 +258,19 @@ func processDay(d time.Time) string {
 	}
 
 	// Increment Index Count (Atomic update under lock)
-	fIdx.Seek(8, io.SeekStart)
+	if _, err := fIdx.Seek(8, io.SeekStart); err != nil {
+		return "error_idx_seek"
+	}
 	var currentCount uint64
-	binary.Read(fIdx, binary.LittleEndian, &currentCount)
-	fIdx.Seek(8, io.SeekStart)
-	binary.Write(fIdx, binary.LittleEndian, currentCount+1)
+	if err := binary.Read(fIdx, binary.LittleEndian, &currentCount); err != nil {
+		return "error_idx_read"
+	}
+	if _, err := fIdx.Seek(8, io.SeekStart); err != nil {
+		return "error_idx_seek"
+	}
+	if err := binary.Write(fIdx, binary.LittleEndian, currentCount+1); err != nil {
+		return "error_idx_write"
+	}
 
 	return "ok"
 }
@@ -256,14 +284,17 @@ func download(url string) ([]byte, error) {
 	for i := 0; i < 3; i++ {
 		resp, err := httpClient.Get(url)
 		if err == nil {
-			if resp.StatusCode == 200 {
-				data, err := io.ReadAll(resp.Body)
+			if resp != nil {
+				if resp.StatusCode == http.StatusOK {
+					data, readErr := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					return data, readErr
+				}
+				if resp.StatusCode == http.StatusNotFound {
+					resp.Body.Close()
+					return nil, errNotFound
+				}
 				resp.Body.Close()
-				return data, err
-			}
-			resp.Body.Close()
-			if resp.StatusCode == 404 {
-				return nil, errNotFound
 			}
 		}
 		time.Sleep(time.Duration(i+1) * 100 * time.Millisecond)
@@ -280,7 +311,7 @@ func isIndexed(idxPath string, day int) bool {
 
 	// Read Header
 	hdr := make([]byte, 16)
-	if _, err := f.Read(hdr); err != nil {
+	if _, err := io.ReadFull(f, hdr); err != nil {
 		return false
 	}
 	if string(hdr[:4]) != IdxMagic {
@@ -288,11 +319,10 @@ func isIndexed(idxPath string, day int) bool {
 	}
 	count := binary.LittleEndian.Uint64(hdr[8:])
 
-	// Scan Rows
+	// Scan Rows (max 31)
 	row := make([]byte, 26)
-	// Optimization: If count is huge, this is slow, but for monthly files (max 31 rows), it's instant.
 	for i := uint64(0); i < count; i++ {
-		if _, err := f.Read(row); err != nil {
+		if _, err := io.ReadFull(f, row); err != nil {
 			break
 		}
 		if int(binary.LittleEndian.Uint16(row[0:])) == day {
@@ -309,6 +339,8 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 		return nil, 0, err
 	}
 
+	const zLevel = zlib.BestSpeed // informational only, used in header
+
 	for _, f := range r.File {
 		if !strings.HasSuffix(f.Name, ".csv") {
 			continue
@@ -319,7 +351,6 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 		}
 
 		// 32GB RAM allows reading full CSV.
-		// For max perf, we read all at once to avoid small IO/syscall overhead.
 		data, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {
@@ -328,6 +359,9 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 
 		// Estimation: ~70 bytes CSV -> 48 bytes Bin
 		estRows := len(data) / 50
+		if estRows < 1 {
+			estRows = 1
+		}
 		blob := make([]byte, 0, estRows*RowSize)
 		rowBuf := make([]byte, RowSize)
 
@@ -344,7 +378,7 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			n      = len(data)
 		)
 
-		// Skip Header Logic
+		// Skip Header Line
 		for i < n {
 			if data[i] == '\n' {
 				i++
@@ -358,12 +392,8 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 		for i < n {
 			b := data[i]
 
-			// Fixed: QF1003 tagged switch on b
 			switch b {
 			case ',':
-				// We only parse if we need the column content.
-				// But we parse all for validation/packing.
-				// Slice is zero-copy (view into 'data')
 				colSlice := data[start:i]
 
 				switch colIdx {
@@ -376,10 +406,8 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 				case 3: // FirstID
 					binary.LittleEndian.PutUint64(rowBuf[24:], fastParseUint(colSlice))
 				case 4: // LastID -> Count
-					// Need FirstID to calc count. FirstID is already in rowBuf[24:]
 					fid := binary.LittleEndian.Uint64(rowBuf[24:])
 					lid := fastParseUint(colSlice)
-					// Count = Last - First + 1
 					binary.LittleEndian.PutUint32(rowBuf[32:], uint32(lid-fid+1))
 				case 5: // Time
 					ts := fastParseUint(colSlice)
@@ -400,7 +428,6 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 				colSlice := data[start:i]
 
 				// Case 6: is_buyer_maker
-				// Check 't' or 'T' (optimized check)
 				flags := uint16(0)
 				if len(colSlice) > 0 {
 					c := colSlice[0]
@@ -436,12 +463,12 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			return nil, 0, nil
 		}
 
-		// Header construction (Matches shared.go AggHeader struct: 48 bytes)
-		hdr := make([]byte, HeaderSize) // HeaderSize is 48 from shared.go
+		// Header construction (Matches AggHeader: 48 bytes)
+		hdr := make([]byte, HeaderSize)
 		copy(hdr[0:], AggMagic)
 		hdr[4] = 1
 		hdr[5] = uint8(t.Day())
-		binary.LittleEndian.PutUint16(hdr[6:], 3) // zlib level (informational)
+		binary.LittleEndian.PutUint16(hdr[6:], uint16(zLevel)) // zlib level (informational)
 		binary.LittleEndian.PutUint64(hdr[8:], count)
 		binary.LittleEndian.PutUint64(hdr[16:], uint64(minTs))
 		binary.LittleEndian.PutUint64(hdr[24:], uint64(maxTs))
@@ -457,7 +484,6 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 func fastParseUint(b []byte) uint64 {
 	var n uint64
 	for _, c := range b {
-		// Rely on valid ASCII digits 0-9
 		n = n*10 + uint64(c-'0')
 	}
 	return n
@@ -474,7 +500,6 @@ func fastParseFloatFixed(b []byte) uint64 {
 			seenDot = true
 			continue
 		}
-		// Branchless logic possible, but this is fast enough for memory-bound tasks
 		n = n*10 + uint64(c-'0')
 		if seenDot {
 			decimals++
@@ -484,7 +509,6 @@ func fastParseFloatFixed(b []byte) uint64 {
 	// Adjust Scale 1e8
 	const target = 8
 	if decimals < target {
-		// Hand-rolled power of 10 for small N is faster than math.Pow
 		for i := 0; i < (target - decimals); i++ {
 			n *= 10
 		}

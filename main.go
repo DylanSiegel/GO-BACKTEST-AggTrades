@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -9,9 +8,9 @@ import (
 )
 
 func main() {
-	// 1. Windows/Ryzen Optimization: High Priority Class
-	// This ensures the OS scheduler prioritizes your Quant/HFT threads
-	runtime.GOMAXPROCS(24) // Pin to your 24 logical threads
+	// Hardware Optimization: Ryzen 9 7900X
+	// Force the Go runtime to schedule goroutines across all logical threads.
+	runtime.GOMAXPROCS(CPUThreads)
 
 	if len(os.Args) < 2 {
 		printHelp()
@@ -21,34 +20,35 @@ func main() {
 	start := time.Now()
 	cmd := os.Args[1]
 
-	// 2. The Dispatcher (Zero-Allocation Switch)
 	switch cmd {
 	case "data":
-		runData()
-	case "build":
-		runBuild()
-	case "sanity":
-		runSanity()
-	case "study":
-		runStudy()
+		runData() // Download + compress Binance data
+	case "ofi":
+		runOFI() // Mass-test OFI core directional variants
 	case "sum":
-		runSum()
+		runSum() // Summarize OFI reports
+	case "sanity":
+		runSanity() // Verify file integrity
+	case "oos":
+		runOOS() // IS/OOS comparison for OFI variants
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 		printHelp()
 		os.Exit(1)
 	}
 
-	// 3. Performance telemetry
 	fmt.Printf("\n[sys] Execution Time: %s | Mem: %s\n", time.Since(start), getMemUsage())
 }
 
 func printHelp() {
 	fmt.Println("Usage: quant.exe [command]")
-	fmt.Println("  data   - Download Binance AggTrades")
-	fmt.Println("  build  - Generate Alpha Features")
-	fmt.Println("  study  - Analyze Signal Decay")
-	fmt.Println("  sum    - Summary Report")
+	fmt.Println("--- DATA PIPELINE ---")
+	fmt.Println("  data    - Download & compress raw aggTrades")
+	fmt.Println("--- ALPHA LAB ---")
+	fmt.Println("  ofi     - Test OFI core directional variants (15ms lag)")
+	fmt.Println("  sum     - Summarize OFI metrics (variant ranking)")
+	fmt.Println("--- AUDIT ---")
+	fmt.Println("  sanity  - Verify data/index integrity")
 }
 
 func getMemUsage() string {
