@@ -9,11 +9,11 @@ import (
 type MetricStats struct {
 	Count        int
 	ICPearson    float64
-	IC_TStat     float64 // Stability
+	IC_TStat     float64 // Stability of IC across days
 	Sharpe       float64
 	HitRate      float64
 	BreakevenBps float64
-	AutoCorr     float64 // Lag-1 Autocorrelation (Corrected)
+	AutoCorr     float64 // Lag-1 autocorrelation (mean-corrected)
 }
 
 type Moments struct {
@@ -29,7 +29,7 @@ type Moments struct {
 	ValidHits   float64
 	Turnover    float64
 	SumProdLag  float64 // Σ(S_t * S_{t-1})
-	SumSqSigLag float64 // Σ(S_{t-1}^2) (Not strictly needed for centered approx, but kept)
+	SumSqSigLag float64 // Σ(S_{t-1}^2) (kept for completeness)
 }
 
 func (m *Moments) Add(m2 Moments) {
@@ -48,6 +48,7 @@ func (m *Moments) Add(m2 Moments) {
 	m.SumSqSigLag += m2.SumSqSigLag
 }
 
+// Stream-based accumulation, used everywhere except quantile materialization.
 func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 	var m Moments
 	first := true
@@ -80,7 +81,6 @@ func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 			}
 			m.Turnover += d
 
-			// Lag-1 accumulators
 			m.SumProdLag += s * prevSig
 			m.SumSqSigLag += prevSig * prevSig
 		} else {
@@ -92,6 +92,52 @@ func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 	return m
 }
 
+// Slice-based variant used when we have already materialized (sig, ret) pairs
+// for quantile analysis. Keeps math identical to CalcMomentsStream.
+func CalcMomentsVectors(sigs, rets []float64) Moments {
+	var m Moments
+	n := len(sigs)
+	if n == 0 {
+		return m
+	}
+	prevSig := 0.0
+
+	for i := 0; i < n; i++ {
+		s := sigs[i]
+		r := rets[i]
+
+		m.Count++
+		m.SumSig += s
+		m.SumRet += r
+		m.SumSqSig += s * s
+		m.SumSqRet += r * r
+		m.SumProd += s * r
+
+		pnl := s * r
+		m.SumPnL += pnl
+		m.SumSqPnL += pnl * pnl
+
+		if s != 0 && r != 0 {
+			m.ValidHits++
+			if (s > 0 && r > 0) || (s < 0 && r < 0) {
+				m.Hits++
+			}
+		}
+
+		if i > 0 {
+			d := s - prevSig
+			if d < 0 {
+				d = -d
+			}
+			m.Turnover += d
+			m.SumProdLag += s * prevSig
+			m.SumSqSigLag += prevSig * prevSig
+		}
+		prevSig = s
+	}
+	return m
+}
+
 func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 	if m.Count <= 1 {
 		return MetricStats{Count: int(m.Count)}
@@ -100,7 +146,6 @@ func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 	ms := MetricStats{Count: int(m.Count)}
 
 	// 1. Pearson IC
-	// Cov(X,Y) / (StdX * StdY)
 	num := m.Count*m.SumProd - m.SumSig*m.SumRet
 	denX := m.Count*m.SumSqSig - m.SumSig*m.SumSig
 	denY := m.Count*m.SumSqRet - m.SumRet*m.SumRet
@@ -108,7 +153,7 @@ func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 		ms.ICPearson = num / math.Sqrt(denX*denY)
 	}
 
-	// 2. Sharpe
+	// 2. Sharpe on per-bar PnL
 	meanPnL := m.SumPnL / m.Count
 	varPnL := (m.SumSqPnL / m.Count) - (meanPnL * meanPnL)
 	if varPnL > 0 {
@@ -120,23 +165,26 @@ func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 		ms.HitRate = m.Hits / m.ValidHits
 	}
 
-	// 4. Breakeven
+	// 4. Breakeven bps per unit turnover
 	if m.Turnover > 0 {
 		ms.BreakevenBps = (m.SumPnL / m.Turnover) * 10000.0
 	}
 
-	// 5. Autocorrelation (Corrected for non-zero mean)
-	// Cov(S_t, S_{t-1}) / Var(S_t)
-	// We assume Mean(S_t) ≈ Mean(S_{t-1}) for large N
-	meanSig := m.SumSig / m.Count
-	covLag := (m.SumProdLag / m.Count) - (meanSig * meanSig)
-	varSig := (m.SumSqSig / m.Count) - (meanSig * meanSig)
+	// 5. Lag-1 Autocorrelation (mean-corrected)
+	// We assume mean(S_t) ~ mean(S_{t-1}) for large N.
+	// Cov_lag ≈ E[S_t S_{t-1}] - E[S]^2
+	// Var(S)  = E[S^2] - E[S]^2
+	if m.Count > 1 {
+		meanSig := m.SumSig / m.Count
+		covLag := (m.SumProdLag / m.Count) - (meanSig * meanSig)
+		varSig := (m.SumSqSig / m.Count) - (meanSig * meanSig)
 
-	if varSig > 1e-15 {
-		ms.AutoCorr = covLag / varSig
+		if varSig > 1e-15 {
+			ms.AutoCorr = covLag / varSig
+		}
 	}
 
-	// 6. IC Stability (t-stat)
+	// 6. IC Stability (t-stat on daily ICs)
 	if len(dailyICs) > 1 {
 		var sum, sumSq float64
 		for _, v := range dailyICs {
@@ -147,7 +195,6 @@ func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 		variance := (sumSq / float64(len(dailyICs))) - (mean * mean)
 		if variance > 0 {
 			stdDev := math.Sqrt(variance)
-			// t = mean / SE = mean / (std / sqrt(N))
 			ms.IC_TStat = mean / (stdDev / math.Sqrt(float64(len(dailyICs))))
 		}
 	}
@@ -155,7 +202,7 @@ func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 	return ms
 }
 
-// --- Quantile Math ---
+// --- Quantile / Monotonicity math ---
 
 type BucketResult struct {
 	ID        int
@@ -164,8 +211,7 @@ type BucketResult struct {
 	Count     int
 }
 
-// ComputeQuantiles sorts (sig, ret) pairs and averages them into buckets.
-// Used for linearity/monotonicity checks.
+// ComputeQuantiles: sort (sig, ret) pairs and bucket by signal strength.
 func ComputeQuantiles(sigs, rets []float64, numBuckets int) []BucketResult {
 	n := len(sigs)
 	if n == 0 || numBuckets <= 0 {
@@ -180,7 +226,6 @@ func ComputeQuantiles(sigs, rets []float64, numBuckets int) []BucketResult {
 		pairs[i] = pair{s: sigs[i], r: rets[i]}
 	}
 
-	// Sort by Signal Strength
 	sort.Slice(pairs, func(i, j int) bool {
 		return pairs[i].s < pairs[j].s
 	})
@@ -217,10 +262,11 @@ func ComputeQuantiles(sigs, rets []float64, numBuckets int) []BucketResult {
 			}
 		}
 	}
+
 	return results
 }
 
-// Aggregates bucket results across days
+// Aggregated bucket stats across many days.
 type BucketAgg struct {
 	Count     int
 	SumSig    float64
@@ -228,6 +274,9 @@ type BucketAgg struct {
 }
 
 func (ba *BucketAgg) Add(br BucketResult) {
+	if br.Count == 0 {
+		return
+	}
 	ba.Count += br.Count
 	ba.SumSig += br.AvgSig * float64(br.Count)
 	ba.SumRetBps += br.AvgRetBps * float64(br.Count)
