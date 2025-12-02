@@ -8,7 +8,7 @@
 |-- ofistudy.go
 |-- sanity.go
     |-- BTCUSDT/
-    |-- features/
+    |-- ETHUSDT/
         |-- 2020/
         |-- 2021/
         |-- 2022/
@@ -21,8 +21,18 @@
             |-- [01..12]/ (12 month dirs)
             |-- [01..12]/ (12 month dirs)
             |-- [01..11]/ (11 month dirs)
-        |-- BTCUSDT/
-            |-- B_Hawkes_Adaptive/
+        |-- 2020/
+        |-- 2021/
+        |-- 2022/
+        |-- 2023/
+        |-- 2024/
+        |-- 2025/
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..12]/ (12 month dirs)
+            |-- [01..11]/ (11 month dirs)
 
 // --- File: common.go ---
 
@@ -30,16 +40,18 @@
 package main
 
 import (
-	"encoding/binary"
+	"unique"
+	"unsafe"
 )
 
 // --- Shared Configuration ---
+
 const (
+	// Ryzen 9 7900X: 12 Cores / 24 Threads.
 	CPUThreads = 24
-	Symbol     = "BTCUSDT"
 	BaseDir    = "data"
 
-	// Binary Layout
+	// Binary Layout Constants
 	PxScale    = 100_000_000.0
 	QtScale    = 100_000_000.0
 	HeaderSize = 48
@@ -48,11 +60,15 @@ const (
 	// Magic Headers
 	AggMagic   = "AGG3"
 	IdxMagic   = "QIDX"
-	IdxVersion = 1 // Index file format version
+	IdxVersion = 1
 )
 
-// --- Zero-Alloc Trade Parsing ---
+// Intern the symbol to keep it in L3 cache.
+var SymbolHandle = unique.Make("ETHUSDT")
 
+func Symbol() string { return SymbolHandle.Value() }
+
+// AggRow corresponds to the logical fields stored in a 48-byte row.
 type AggRow struct {
 	TsMs       int64
 	PriceFixed uint64
@@ -60,13 +76,20 @@ type AggRow struct {
 	Flags      uint16
 }
 
-// ParseAggRow interprets a 48-byte row from data.quantdev without allocation.
+// ParseAggRow - ZEN 4 OPTIMIZED
+// Uses unsafe pointer arithmetic to bypass Go bounds checks.
+// The caller GUARANTEES row has at least 48 bytes and matches the AGG3 layout.
 func ParseAggRow(row []byte) AggRow {
+	ptr := unsafe.Pointer(&row[0])
 	return AggRow{
-		TsMs:       int64(binary.LittleEndian.Uint64(row[38:])),
-		PriceFixed: binary.LittleEndian.Uint64(row[8:]),
-		QtyFixed:   binary.LittleEndian.Uint64(row[16:]),
-		Flags:      binary.LittleEndian.Uint16(row[36:]),
+		// Offset 38: Timestamp (uint64)
+		TsMs: int64(*(*uint64)(unsafe.Add(ptr, 38))),
+		// Offset 8: Price (fixed-point, 1e-8)
+		PriceFixed: *(*uint64)(unsafe.Add(ptr, 8)),
+		// Offset 16: Quantity (fixed-point, 1e-8)
+		QtyFixed: *(*uint64)(unsafe.Add(ptr, 16)),
+		// Offset 36: Flags (uint16), bit 0 encodes is_buyer_maker.
+		Flags: *(*uint16)(unsafe.Add(ptr, 36)),
 	}
 }
 
@@ -82,10 +105,12 @@ func TradeDollar(row AggRow) float64 {
 	return TradePrice(row) * TradeQty(row)
 }
 
-// TradeSign returns +1 for taker buy, -1 for taker sell.
+// TradeSign:
+//
+//	Flags&1 == 1  -> is_buyer_maker == true -> seller-initiated -> -1
+//	Flags&1 == 0  -> is_buyer_maker == false -> buyer-initiated  -> +1
 func TradeSign(row AggRow) float64 {
 	if row.Flags&1 != 0 {
-		// buyer is maker -> taker is seller
 		return -1.0
 	}
 	return 1.0
@@ -114,31 +139,24 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 )
 
-// --- Local Constants (Specific to Data Downloader) ---
 const (
-	// Data Source
 	HostData   = "data.binance.vision"
 	S3Prefix   = "data/futures/um"
 	DataSet    = "aggTrades"
 	FallbackDt = "2020-01-01"
 )
 
-// --- Globals ---
 var (
 	httpClient *http.Client
-	stopEvent  bool
-	stopMu     sync.Mutex
-
-	// Directory Locks to fix race conditions on monthly files
-	dirLocks sync.Map
+	stopEvent  atomic.Bool
+	dirLocks   sync.Map
 )
 
 func init() {
-	// High-throughput Transport (no TLS hacks)
 	tr := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
@@ -150,20 +168,17 @@ func init() {
 	}
 }
 
-// runData is called by main()
 func runData() {
-	// Graceful Shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// On Windows, os.Interrupt is the relevant signal.
+	signal.Notify(sigChan, os.Interrupt)
 	go func() {
 		<-sigChan
-		stopMu.Lock()
-		stopEvent = true
-		stopMu.Unlock()
+		stopEvent.Store(true)
 		fmt.Println("\n[warn] Stopping gracefully (finish current jobs)...")
 	}()
 
-	fmt.Printf("--- data.go (Ryzen 7900X Optimized) | Symbol: %s ---\n", Symbol)
+	fmt.Printf("--- data.go (Ryzen 7900X Safe-Mode) | Symbol: %s ---\n", Symbol())
 
 	start, err := time.Parse("2006-01-02", FallbackDt)
 	if err != nil {
@@ -177,7 +192,6 @@ func runData() {
 		return
 	}
 
-	// Generate Job Queue
 	var days []time.Time
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
 		days = append(days, d)
@@ -189,20 +203,14 @@ func runData() {
 	results := make(chan string, len(days))
 	var wg sync.WaitGroup
 
-	// Workers
 	for i := 0; i < CPUThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for d := range jobs {
-				// Check Stop Signal
-				stopMu.Lock()
-				if stopEvent {
-					stopMu.Unlock()
+				if stopEvent.Load() {
 					return
 				}
-				stopMu.Unlock()
-
 				results <- processDay(d)
 			}
 		}()
@@ -215,7 +223,6 @@ func runData() {
 	wg.Wait()
 	close(results)
 
-	// Stats
 	stats := make(map[string]int)
 	for r := range results {
 		key := strings.SplitN(r, " ", 2)[0]
@@ -227,16 +234,13 @@ func runData() {
 func processDay(d time.Time) string {
 	y, m, day := d.Year(), int(d.Month()), d.Day()
 
-	// Paths
-	dirPath := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", y), fmt.Sprintf("%02d", m))
+	dirPath := filepath.Join(BaseDir, Symbol(), fmt.Sprintf("%04d", y), fmt.Sprintf("%02d", m))
 	idxPath := filepath.Join(dirPath, "index.quantdev")
 	dataPath := filepath.Join(dirPath, "data.quantdev")
 
-	// 1. Get Directory Lock (serialize Index/Data per month)
 	muAny, _ := dirLocks.LoadOrStore(dirPath, &sync.Mutex{})
 	mu := muAny.(*sync.Mutex)
 
-	// 2. Check Index (Fast Read)
 	mu.Lock()
 	indexed := isIndexed(idxPath, day)
 	mu.Unlock()
@@ -245,9 +249,9 @@ func processDay(d time.Time) string {
 		return "skip"
 	}
 
-	// 3. Download (Concurrent / Slow IO)
+	sym := Symbol()
 	url := fmt.Sprintf("https://%s/%s/daily/%s/%s/%s-%s-%04d-%02d-%02d.zip",
-		HostData, S3Prefix, DataSet, Symbol, Symbol, DataSet, y, m, day)
+		HostData, S3Prefix, DataSet, sym, sym, DataSet, y, m, day)
 
 	zipBytes, err := download(url)
 	if err != nil {
@@ -257,7 +261,6 @@ func processDay(d time.Time) string {
 		return "error_dl"
 	}
 
-	// 4. Fast Parse (Concurrent / High CPU)
 	aggBlob, count, err := fastZipToAgg3(d, zipBytes)
 	if err != nil {
 		return "error_parse"
@@ -266,10 +269,8 @@ func processDay(d time.Time) string {
 		return "empty"
 	}
 
-	// 5. Compress (Concurrent / High CPU)
 	var b bytes.Buffer
-	const zLevel = zlib.BestSpeed
-	w, err := zlib.NewWriterLevel(&b, zLevel)
+	w, err := zlib.NewWriterLevel(&b, zlib.BestSpeed)
 	if err != nil {
 		return "error_zlib"
 	}
@@ -282,25 +283,21 @@ func processDay(d time.Time) string {
 	}
 	compBlob := b.Bytes()
 
-	// 6. Checksum (Concurrent)
 	sum := sha256.Sum256(aggBlob)
 	cSum := binary.LittleEndian.Uint64(sum[:8])
 
-	// 7. Write Data & Update Index (Serialized / Fast IO)
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Double check index in case another thread finished this day while we were processing
 	if isIndexed(idxPath, day) {
 		return "skip_race"
 	}
 
-	if err := os.MkdirAll(dirPath, 0755); err != nil {
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
 		return "error_mkdir"
 	}
 
-	// Append Data
-	fData, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	fData, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return "error_io"
 	}
@@ -315,12 +312,9 @@ func processDay(d time.Time) string {
 		fData.Close()
 		return "error_write"
 	}
-	if err := fData.Close(); err != nil {
-		return "error_close_data"
-	}
+	fData.Close()
 
-	// Append / Init Index
-	fIdx, err := os.OpenFile(idxPath, os.O_CREATE|os.O_RDWR, 0644)
+	fIdx, err := os.OpenFile(idxPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return "error_idx"
 	}
@@ -331,18 +325,16 @@ func processDay(d time.Time) string {
 		return "error_idx_stat"
 	}
 	if idxStat.Size() == 0 {
-		// Init Index Header
-		hdr := make([]byte, 16)
+		var hdr [16]byte
 		copy(hdr[0:], IdxMagic)
 		binary.LittleEndian.PutUint32(hdr[4:], uint32(IdxVersion))
-		binary.LittleEndian.PutUint64(hdr[8:], 0) // Count = 0
-		if _, err := fIdx.Write(hdr); err != nil {
+		binary.LittleEndian.PutUint64(hdr[8:], 0)
+		if _, err := fIdx.Write(hdr[:]); err != nil {
 			return "error_idx_hdr"
 		}
 	}
 
-	// Index Row: Day(2), Offset(8), Length(8), Checksum(8) = 26 bytes
-	row := make([]byte, 26)
+	var row [26]byte
 	binary.LittleEndian.PutUint16(row[0:], uint16(day))
 	binary.LittleEndian.PutUint64(row[2:], uint64(offset))
 	binary.LittleEndian.PutUint64(row[10:], uint64(len(compBlob)))
@@ -351,11 +343,10 @@ func processDay(d time.Time) string {
 	if _, err := fIdx.Seek(0, io.SeekEnd); err != nil {
 		return "error_idx_seek"
 	}
-	if _, err := fIdx.Write(row); err != nil {
+	if _, err := fIdx.Write(row[:]); err != nil {
 		return "error_idx_write"
 	}
 
-	// Increment Index Count (Atomic update under lock)
 	if _, err := fIdx.Seek(8, io.SeekStart); err != nil {
 		return "error_idx_seek"
 	}
@@ -378,7 +369,6 @@ func processDay(d time.Time) string {
 var errNotFound = fmt.Errorf("404")
 
 func download(url string) ([]byte, error) {
-	// Retry logic optimized for throughput
 	for i := 0; i < 3; i++ {
 		resp, err := httpClient.Get(url)
 		if err == nil {
@@ -407,9 +397,8 @@ func isIndexed(idxPath string, day int) bool {
 	}
 	defer f.Close()
 
-	// Read Header
-	hdr := make([]byte, 16)
-	if _, err := io.ReadFull(f, hdr); err != nil {
+	var hdr [16]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
 		return false
 	}
 	if string(hdr[:4]) != IdxMagic {
@@ -417,10 +406,9 @@ func isIndexed(idxPath string, day int) bool {
 	}
 	count := binary.LittleEndian.Uint64(hdr[8:])
 
-	// Scan Rows (max 31)
-	row := make([]byte, 26)
+	var row [26]byte
 	for i := uint64(0); i < count; i++ {
-		if _, err := io.ReadFull(f, row); err != nil {
+		if _, err := io.ReadFull(f, row[:]); err != nil {
 			break
 		}
 		if int(binary.LittleEndian.Uint16(row[0:])) == day {
@@ -430,14 +418,48 @@ func isIndexed(idxPath string, day int) bool {
 	return false
 }
 
-// fastZipToAgg3: Zero-alloc column scanning + Binary Packing
+// parseBuyerMakerFlag interprets the is_buyer_maker CSV column.
+// Expect values like "true"/"false" (case-insensitive).
+// Returns bit 0 = 1 if is_buyer_maker == true.
+func parseBuyerMakerFlag(col []byte) uint16 {
+	if len(col) == 0 {
+		return 0
+	}
+	switch col[0] {
+	case 't', 'T': // "true"
+		return 1
+	default:
+		return 0
+	}
+}
+
+// --- CSV Parser ---
+//
+// CSV Layout (7 columns):
+//
+//	0: agg_trade_id      (uint64)
+//	1: price             (float, fixed-point 1e-8)
+//	2: quantity          (float, fixed-point 1e-8)
+//	3: first_trade_id    (uint64)
+//	4: last_trade_id     (uint64)
+//	5: transact_time     (uint64, ms)
+//	6: is_buyer_maker    ("true"/"false")
+//
+// Row layout (RowSize = 48):
+//
+//	0..7   : agg_trade_id (uint64)          [optional, not used downstream]
+//	8..15  : price_fixed (uint64)
+//	16..23 : qty_fixed   (uint64)
+//	24..31 : first_trade_id (uint64)
+//	32..35 : trade_count = last - first + 1 (uint32)
+//	36..37 : flags (uint16), bit 0 = is_buyer_maker
+//	38..45 : transact_time (uint64)
+//	46..47 : unused / padding
 func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 	r, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		return nil, 0, err
 	}
-
-	const zLevel = zlib.BestSpeed // informational only, used in header
 
 	for _, f := range r.File {
 		if !strings.HasSuffix(f.Name, ".csv") {
@@ -448,35 +470,30 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			continue
 		}
 
-		// 32GB RAM allows reading full CSV.
 		data, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {
 			return nil, 0, err
 		}
 
-		// Estimation: ~70 bytes CSV -> 48 bytes Bin
 		estRows := len(data) / 50
 		if estRows < 1 {
 			estRows = 1
 		}
 		blob := make([]byte, 0, estRows*RowSize)
-		rowBuf := make([]byte, RowSize)
+		var rowBuf [RowSize]byte
 
 		var (
-			minTs int64 = math.MaxInt64
-			maxTs int64 = math.MinInt64
-			count uint64
-
-			// Column Tracking
-			// 0:id, 1:px, 2:qty, 3:fid, 4:lid, 5:ts, 6:m
+			minTs  int64 = math.MaxInt64
+			maxTs  int64 = math.MinInt64
+			count  uint64
 			colIdx int
 			start  int
 			i      int
 			n      = len(data)
 		)
 
-		// Skip Header Line
+		// Skip header line
 		for i < n {
 			if data[i] == '\n' {
 				i++
@@ -486,74 +503,69 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			i++
 		}
 
-		// State Machine Loop
 		for i < n {
 			b := data[i]
-
 			switch b {
 			case ',':
 				colSlice := data[start:i]
-
 				switch colIdx {
-				case 0: // AggID
+				case 0:
+					// agg_trade_id (stored but not used downstream)
 					binary.LittleEndian.PutUint64(rowBuf[0:], fastParseUint(colSlice))
-				case 1: // Price
+				case 1:
+					// price
 					binary.LittleEndian.PutUint64(rowBuf[8:], fastParseFloatFixed(colSlice))
-				case 2: // Qty
+				case 2:
+					// quantity
 					binary.LittleEndian.PutUint64(rowBuf[16:], fastParseFloatFixed(colSlice))
-				case 3: // FirstID
+				case 3:
+					// first_trade_id
 					binary.LittleEndian.PutUint64(rowBuf[24:], fastParseUint(colSlice))
-				case 4: // LastID -> Count
+				case 4:
+					// last_trade_id -> trade count
 					fid := binary.LittleEndian.Uint64(rowBuf[24:])
 					lid := fastParseUint(colSlice)
-					binary.LittleEndian.PutUint32(rowBuf[32:], uint32(lid-fid+1))
-				case 5: // Time
+					if lid >= fid {
+						binary.LittleEndian.PutUint32(rowBuf[32:], uint32(lid-fid+1))
+					} else {
+						binary.LittleEndian.PutUint32(rowBuf[32:], 0)
+					}
+				case 5:
+					// transact_time
 					ts := fastParseUint(colSlice)
 					binary.LittleEndian.PutUint64(rowBuf[38:], ts)
-					if int64(ts) < minTs {
-						minTs = int64(ts)
+					ts64 := int64(ts)
+					if ts64 < minTs {
+						minTs = ts64
 					}
-					if int64(ts) > maxTs {
-						maxTs = int64(ts)
+					if ts64 > maxTs {
+						maxTs = ts64
 					}
 				}
-
 				colIdx++
 				start = i + 1
 
 			case '\n':
-				// End of row (Maker Flag)
+				// Last column: is_buyer_maker
 				colSlice := data[start:i]
-
-				// Case 6: is_buyer_maker
-				flags := uint16(0)
-				if len(colSlice) > 0 {
-					c := colSlice[0]
-					if c == 't' || c == 'T' {
-						flags = 1
-					}
-				}
+				flags := parseBuyerMakerFlag(colSlice)
 				binary.LittleEndian.PutUint16(rowBuf[36:], flags)
 
-				// Append Row
-				blob = append(blob, rowBuf...)
+				blob = append(blob, rowBuf[:]...)
 				count++
-
 				colIdx = 0
 				start = i + 1
 			}
 			i++
 		}
 
-		// Handle case where file doesn't end with \n
+		// Handle final line without trailing newline
 		if colIdx == 6 && start < n {
 			colSlice := data[start:n]
-			flags := uint16(0)
-			if len(colSlice) > 0 && (colSlice[0] == 't' || colSlice[0] == 'T') {
-				flags = 1
-			}
+			flags := parseBuyerMakerFlag(colSlice)
 			binary.LittleEndian.PutUint16(rowBuf[36:], flags)
-			blob = append(blob, rowBuf...)
+
+			blob = append(blob, rowBuf[:]...)
 			count++
 		}
 
@@ -561,23 +573,22 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			return nil, 0, nil
 		}
 
-		// Header construction (Matches AggHeader: 48 bytes)
-		hdr := make([]byte, HeaderSize)
+		var hdr [HeaderSize]byte
 		copy(hdr[0:], AggMagic)
-		hdr[4] = 1
-		hdr[5] = uint8(t.Day())
-		binary.LittleEndian.PutUint16(hdr[6:], uint16(zLevel)) // zlib level (informational)
+		hdr[4] = 1              // version
+		hdr[5] = uint8(t.Day()) // day-of-month
+		binary.LittleEndian.PutUint16(hdr[6:], uint16(zlib.BestSpeed))
 		binary.LittleEndian.PutUint64(hdr[8:], count)
 		binary.LittleEndian.PutUint64(hdr[16:], uint64(minTs))
 		binary.LittleEndian.PutUint64(hdr[24:], uint64(maxTs))
-		// Bytes 32-47 are padding (zero initialized by make)
 
-		return append(hdr, blob...), count, nil
+		out := make([]byte, 0, HeaderSize+len(blob))
+		out = append(out, hdr[:]...)
+		out = append(out, blob...)
+		return out, count, nil
 	}
 	return nil, 0, fmt.Errorf("no csv")
 }
-
-// --- High Performance Parsers (No Alloc) ---
 
 func fastParseUint(b []byte) uint64 {
 	var n uint64
@@ -587,7 +598,12 @@ func fastParseUint(b []byte) uint64 {
 	return n
 }
 
-// Converts "123.45" -> 12345000000 (scaled 1e8)
+const targetDecimals = 8
+
+var pow10 = [...]uint64{
+	1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
+}
+
 func fastParseFloatFixed(b []byte) uint64 {
 	var n uint64
 	seenDot := false
@@ -604,16 +620,27 @@ func fastParseFloatFixed(b []byte) uint64 {
 		}
 	}
 
-	// Adjust Scale 1e8
-	const target = 8
-	if decimals < target {
-		for i := 0; i < (target - decimals); i++ {
+	if decimals == targetDecimals {
+		return n
+	}
+
+	if decimals < targetDecimals {
+		diff := targetDecimals - decimals
+		if diff < len(pow10) {
+			return n * pow10[diff]
+		}
+		for i := 0; i < diff; i++ {
 			n *= 10
 		}
-	} else if decimals > target {
-		for i := 0; i < (decimals - target); i++ {
-			n /= 10
-		}
+		return n
+	}
+
+	diff := decimals - targetDecimals
+	if diff < len(pow10) {
+		return n / pow10[diff]
+	}
+	for i := 0; i < diff; i++ {
+		n /= 10
 	}
 	return n
 }
@@ -634,7 +661,6 @@ import (
 )
 
 func main() {
-	// Hardware Optimization: Ryzen 9 7900X
 	runtime.GOMAXPROCS(CPUThreads)
 
 	if len(os.Args) < 2 {
@@ -643,17 +669,24 @@ func main() {
 	}
 
 	start := time.Now()
+
+	fmt.Printf("Go 1.25.4 | Env: %s/%s | Threads: %d | GOGC: %s | AMD64: %s\n",
+		runtime.GOOS, runtime.GOARCH,
+		runtime.GOMAXPROCS(0),
+		os.Getenv("GOGC"),
+		os.Getenv("GOAMD64"))
+
 	cmd := os.Args[1]
 
 	switch cmd {
 	case "data":
-		runData() // Download
+		runData()
 	case "build":
-		runBuild() // Run Models -> .bin
+		runBuild()
 	case "study":
-		runStudy() // IS/OOS Stats
+		runStudy()
 	case "sanity":
-		runSanity() // Integrity Check
+		runSanity()
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 		printHelp()
@@ -685,25 +718,27 @@ func getMemUsage() string {
 ```go
 package main
 
-import "math"
+import (
+	"iter"
+	"math"
+	"sort"
+)
 
-// MetricStats holds the final calculated metrics for human consumption.
 type MetricStats struct {
 	Count        int
-	ICPearson    float64 // Linear IC
-	Sharpe       float64 // Per-trade Sharpe
-	SharpeAnnual float64 // t-statistic (Sharpe * sqrt(N))
-	HitRate      float64 // Directional accuracy
-	BreakevenBps float64 // Cost per unit turnover to zero PnL
+	ICPearson    float64
+	IC_TStat     float64 // Stability of IC across days
+	Sharpe       float64
+	HitRate      float64
+	BreakevenBps float64
+	AutoCorr     float64 // Lag-1 autocorrelation of signal
 }
 
-// Moments holds raw sums for global aggregation (IC, Sharpe, Turnover).
-// Optimized for memory alignment on amd64.
 type Moments struct {
 	Count     float64
 	SumSig    float64
 	SumRet    float64
-	SumProd   float64 // Sum(Sig * Ret)
+	SumProd   float64
 	SumSqSig  float64
 	SumSqRet  float64
 	SumPnL    float64
@@ -711,9 +746,12 @@ type Moments struct {
 	Hits      float64
 	ValidHits float64
 	Turnover  float64
+
+	// New: Autocorrelation terms (lag 1)
+	SumProdLag  float64 // Σ(S_t * S_{t-1})
+	SumSqSigLag float64 // Σ(S_{t-1}^2)
 }
 
-// Add accumulates m2 into m (In-place).
 func (m *Moments) Add(m2 Moments) {
 	m.Count += m2.Count
 	m.SumSig += m2.SumSig
@@ -726,87 +764,67 @@ func (m *Moments) Add(m2 Moments) {
 	m.Hits += m2.Hits
 	m.ValidHits += m2.ValidHits
 	m.Turnover += m2.Turnover
+	m.SumProdLag += m2.SumProdLag
+	m.SumSqSigLag += m2.SumSqSigLag
 }
 
-// CalcMoments computes raw moments for a single chunk/day.
-// Optimized for AVX2 pipeline (simple float operations, branch-light).
-func CalcMoments(sig, ret []float64) Moments {
-	n := len(sig)
-	if n < 2 {
-		return Moments{}
-	}
-
+// CalcMomentsStream consumes a zero-alloc iterator and now also
+// accumulates lag-1 autocorrelation terms.
+func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 	var m Moments
-	m.Count = float64(n)
+	first := true
+	prevSig := 0.0
 
-	// Local registers for hot loop
-	var (
-		sSum, rSum, sSq, rSq, prodSum float64
-		pnlSum, pnlSq                 float64
-		hits, valid                   float64
-		turnover, prevSig             float64
-	)
+	for s, r := range seq {
+		m.Count++
 
-	prevSig = sig[0] // approximation
+		m.SumSig += s
+		m.SumRet += r
+		m.SumSqSig += s * s
+		m.SumSqRet += r * r
+		m.SumProd += s * r
 
-	for i := 0; i < n; i++ {
-		s := sig[i]
-		r := ret[i]
-
-		// Pearson components
-		sSum += s
-		rSum += r
-		sSq += s * s
-		rSq += r * r
-		prodSum += s * r
-
-		// PnL components
 		pnl := s * r
-		pnlSum += pnl
-		pnlSq += pnl * pnl
+		m.SumPnL += pnl
+		m.SumSqPnL += pnl * pnl
 
-		// Hit Rate
 		if s != 0 && r != 0 {
-			valid++
+			m.ValidHits++
 			if (s > 0 && r > 0) || (s < 0 && r < 0) {
-				hits++
+				m.Hits++
 			}
 		}
 
-		// Turnover
-		if i > 0 {
+		if !first {
 			d := s - prevSig
 			if d < 0 {
 				d = -d
 			}
-			turnover += d
+			m.Turnover += d
+
+			// Lag-1 autocorr assuming mean ~ 0 (so we avoid a 2-pass mean correction).
+			m.SumProdLag += s * prevSig
+			m.SumSqSigLag += prevSig * prevSig
+		} else {
+			first = false
 		}
 		prevSig = s
 	}
 
-	m.SumSig = sSum
-	m.SumRet = rSum
-	m.SumSqSig = sSq
-	m.SumSqRet = rSq
-	m.SumProd = prodSum
-	m.SumPnL = pnlSum
-	m.SumSqPnL = pnlSq
-	m.Hits = hits
-	m.ValidHits = valid
-	m.Turnover = turnover
-
 	return m
 }
 
-// FinalizeMetrics computes the ratios from aggregated moments.
-func FinalizeMetrics(m Moments) MetricStats {
+// FinalizeMetrics now takes:
+//   - aggregated Moments across all days
+//   - dailyICs: slice of per-day ICs for this feature/horizon
+func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 	if m.Count <= 1 {
-		return MetricStats{}
+		return MetricStats{Count: int(m.Count)}
 	}
 
 	ms := MetricStats{Count: int(m.Count)}
 
-	// 1. Global Pearson IC
+	// 1. Pearson IC on the full sample
 	num := m.Count*m.SumProd - m.SumSig*m.SumRet
 	denX := m.Count*m.SumSqSig - m.SumSig*m.SumSig
 	denY := m.Count*m.SumSqRet - m.SumRet*m.SumRet
@@ -814,14 +832,11 @@ func FinalizeMetrics(m Moments) MetricStats {
 		ms.ICPearson = num / math.Sqrt(denX*denY)
 	}
 
-	// 2. Per-Trade Sharpe
+	// 2. Sharpe on PnL (per-bar)
 	meanPnL := m.SumPnL / m.Count
 	varPnL := (m.SumSqPnL / m.Count) - (meanPnL * meanPnL)
-
 	if varPnL > 0 {
 		ms.Sharpe = meanPnL / math.Sqrt(varPnL)
-		// Annualized via t-stat logic
-		ms.SharpeAnnual = ms.Sharpe * math.Sqrt(m.Count)
 	}
 
 	// 3. Hit Rate
@@ -829,12 +844,100 @@ func FinalizeMetrics(m Moments) MetricStats {
 		ms.HitRate = m.Hits / m.ValidHits
 	}
 
-	// 4. Breakeven
+	// 4. Breakeven bps per unit turnover
 	if m.Turnover > 0 {
 		ms.BreakevenBps = (m.SumPnL / m.Turnover) * 10000.0
 	}
 
+	// 5. Lag-1 Autocorrelation
+	// Corr ≈ SumProdLag / sqrt(SumSqSig * SumSqSigLag)
+	if m.SumSqSig > 0 && m.SumSqSigLag > 0 {
+		ms.AutoCorr = m.SumProdLag / math.Sqrt(m.SumSqSig*m.SumSqSigLag)
+	}
+
+	// 6. IC Stability (t-stat over daily ICs)
+	if len(dailyICs) > 1 {
+		var sum, sumSq float64
+		for _, v := range dailyICs {
+			sum += v
+			sumSq += v * v
+		}
+		mean := sum / float64(len(dailyICs))
+		variance := (sumSq / float64(len(dailyICs))) - (mean * mean)
+		if variance > 0 {
+			stdDev := math.Sqrt(variance)
+			ms.IC_TStat = mean / (stdDev / math.Sqrt(float64(len(dailyICs))))
+		}
+	}
+
 	return ms
+}
+
+// --- Quantile Math (Monotonicity) ---
+
+type BucketResult struct {
+	ID        int // 1..numBuckets
+	AvgSig    float64
+	AvgRetBps float64
+	Count     int
+}
+
+// ComputeQuantiles: signal monotonicity / shape check.
+// Sorts all (sig, ret) pairs into numBuckets buckets by signal value.
+func ComputeQuantiles(sigs, rets []float64, numBuckets int) []BucketResult {
+	n := len(sigs)
+	if n == 0 || numBuckets <= 0 {
+		return nil
+	}
+
+	type pair struct {
+		s, r float64
+	}
+	pairs := make([]pair, n)
+	for i := 0; i < n; i++ {
+		pairs[i] = pair{s: sigs[i], r: rets[i]}
+	}
+
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].s < pairs[j].s
+	})
+
+	results := make([]BucketResult, numBuckets)
+	bucketSize := n / numBuckets
+	if bucketSize == 0 {
+		bucketSize = 1
+	}
+
+	for b := 0; b < numBuckets; b++ {
+		start := b * bucketSize
+		end := start + bucketSize
+		if b == numBuckets-1 || end > n {
+			end = n
+		}
+		if start >= n {
+			break
+		}
+
+		var sumS, sumR float64
+		count := 0
+		for i := start; i < end; i++ {
+			sumS += pairs[i].s
+			sumR += pairs[i].r
+			count++
+		}
+		if count == 0 {
+			continue
+		}
+
+		results[b] = BucketResult{
+			ID:        b + 1,
+			AvgSig:    sumS / float64(count),
+			AvgRetBps: (sumR / float64(count)) * 10000.0,
+			Count:     count,
+		}
+	}
+
+	return results
 }
 ```
 
@@ -855,79 +958,129 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// --- Build Configuration ---
-
-// Hint for per-thread output buffer reservation; real days can exceed this and
-// the buffer is grown as needed.
 const BuildMaxRows = 10_000_000
 
-// --- Main Builder (Single Champion Variant) ---
+// --- Configuration ---
+
+type FiveDimConfig struct {
+	RingSize     int
+	Lfast, Lslow float64
+	VarAlphaB    float64 // EWMA alpha for B variance
+	AlphaAbs     float64 // EWMA alpha for Absorption Baseline
+	VarAlphaS    float64 // EWMA alpha for Surplus variance
+	AlphaE       float64 // EWMA alpha for Elasticity reference
+}
+
+type VariantDef struct {
+	ID  string
+	Cfg FiveDimConfig
+}
+
+// Optimized Task: Carries the exact file location to avoid redundant lookups.
+type ofiTask struct {
+	Y, M, D        int
+	Offset, Length int64
+}
 
 func runBuild() {
 	start := time.Now()
 
-	featRoot := filepath.Join(BaseDir, "features", Symbol)
-	variantID := "B_Hawkes_Adaptive"
+	// Adaptive Base Config
+	// Lfast=2.0 (info-time), Lslow=300 (info-time) ~ roughly 2s and 5m in volume-time terms
+	baseCfg := FiveDimConfig{
+		RingSize:  20_000,
+		Lfast:     2.0,
+		Lslow:     300.0,
+		VarAlphaB: 0.001, // slow variance decay
+		AlphaAbs:  0.01,  // absorption baseline adaptation
+		VarAlphaS: 0.005,
+		AlphaE:    0.001,
+	}
 
-	fmt.Printf("--- FEATURE BUILDER | %s | 1 Variants ---\n", Symbol)
-	fmt.Printf("Output: %s\n", featRoot)
+	variants := []VariantDef{
+		{ID: "5D_Adaptive_Base", Cfg: baseCfg},
+		{
+			ID: "5D_Adaptive_Fast",
+			Cfg: func() FiveDimConfig {
+				c := baseCfg
+				c.Lfast = 0.5
+				c.Lslow = 60.0
+				return c
+			}(),
+		},
+	}
 
-	// Ensure variant directory exists.
-	if err := os.MkdirAll(filepath.Join(featRoot, variantID), 0755); err != nil {
-		fmt.Printf("[err] mkdir %s: %v\n", featRoot, err)
+	symbols := discoverSymbols()
+	fmt.Printf("--- FEATURE BUILDER (5D Adaptive) | Found Symbols: %v ---\n", symbols)
+
+	for _, sym := range symbols {
+		buildForSymbol(sym, variants)
+	}
+
+	fmt.Printf("[build] ALL SYMBOLS COMPLETE in %s\n", time.Since(start))
+}
+
+func discoverSymbols() []string {
+	var syms []string
+	entries, err := os.ReadDir(BaseDir)
+	if err != nil {
+		return syms
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == "features" || name == "common" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		syms = append(syms, name)
+	}
+	return syms
+}
+
+func buildForSymbol(sym string, variants []VariantDef) {
+	fmt.Printf("\n>>> Building for %s <<<\n", sym)
+	featRoot := filepath.Join(BaseDir, "features", sym)
+
+	tasks := discoverTasks(sym)
+	if len(tasks) == 0 {
+		fmt.Printf("[warn] No data found for %s\n", sym)
 		return
 	}
 
-	// Discover all (Y,M,D) with data.
-	tasks := discoverTasks()
-	fmt.Printf("[build] Processing %d days.\n", len(tasks))
-
-	workerCount := CPUThreads
-	if workerCount < 1 {
-		workerCount = 1
+	for _, v := range variants {
+		buildVariant(sym, v, tasks, featRoot)
 	}
-	fmt.Printf("[build] Using %d threads.\n", workerCount)
+}
 
-	// Champion config (same as before).
-	cfg := HawkesAdaptiveConfig{
-		HawkesCfg: Hawkes2ScaleConfig{
-			TauFast: 2, TauSlow: 300,
-			MuBuy:  0.1,
-			MuSell: 0.1,
-
-			A_pp_fast: 1.2, A_pm_fast: 0.0,
-			A_mp_fast: 0.0, A_mm_fast: 1.2,
-
-			A_pp_slow: 0.3, A_pm_slow: 0.1,
-			A_mp_slow: 0.1, A_mm_slow: 0.3,
-
-			D0:           50_000,
-			VolLambda:    0.999,
-			ZScoreLambda: 0.9999,
-			SquashScale:  2.0,
-		},
-		ActivityLambda: 0.99,
-		ActMid:         15.0,
-		ActSlope:       2.0,
+func buildVariant(sym string, v VariantDef, tasks []ofiTask, featRoot string) {
+	vStart := time.Now()
+	outDir := filepath.Join(featRoot, v.ID)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fmt.Printf("[err] mkdir %s: %v\n", outDir, err)
+		return
 	}
 
 	jobs := make(chan ofiTask, len(tasks))
 	var wg sync.WaitGroup
 
-	for i := 0; i < workerCount; i++ {
+	workers := CPUThreads
+
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
-			// Per-thread reusable output buffer.
-			binBuf := make([]byte, 0, BuildMaxRows*8)
-
+			// Buffer: 10M rows * 5 features * 8 bytes = 400MB max per day
+			// We reuse this buffer across days for this worker.
+			binBuf := make([]byte, 0, BuildMaxRows*5*8)
 			for t := range jobs {
-				processBuildDay(t, featRoot, variantID, cfg, &binBuf)
+				processBuildDay(sym, t, outDir, v.Cfg, &binBuf)
 			}
 		}()
 	}
@@ -938,138 +1091,412 @@ func runBuild() {
 	close(jobs)
 	wg.Wait()
 
-	fmt.Printf("[build] Complete in %s\n", time.Since(start))
+	fmt.Printf("[build] %s / %s done in %s\n", sym, v.ID, time.Since(vStart))
 }
 
-// processBuildDay: load raw AGG3 once, run champion model over all rows.
 func processBuildDay(
+	sym string,
 	t ofiTask,
-	root string,
-	variantID string,
-	cfg HawkesAdaptiveConfig,
+	outDir string,
+	cfg FiveDimConfig,
 	binBuf *[]byte,
 ) {
-	rawBytes, rowCount, ok := loadRawDay(t.Y, t.M, t.D)
+	dateStr := fmt.Sprintf("%04d%02d%02d", t.Y, t.M, t.D)
+	outPath := filepath.Join(outDir, dateStr+".bin")
+
+	if _, err := os.Stat(outPath); err == nil {
+		return
+	}
+
+	rawBytes, rowCount, ok := loadRawBlob(sym, t)
 	if !ok || rowCount == 0 {
 		return
 	}
 
 	n := int(rowCount)
-	dateStr := fmt.Sprintf("%04d%02d%02d", t.Y, t.M, t.D)
-	outPath := filepath.Join(root, variantID, dateStr+".bin")
-
-	// Skip if already built.
-	if _, err := os.Stat(outPath); err == nil {
-		return
-	}
-
-	// Ensure buffer capacity.
-	reqSize := n * 8
+	// Output: 5 float64s per row
+	reqSize := n * 5 * 8
 	if cap(*binBuf) < reqSize {
 		*binBuf = make([]byte, reqSize)
 	}
 	*binBuf = (*binBuf)[:reqSize]
 
-	// Concrete model instance (no interface dispatch).
-	st := NewHawkesAdaptiveState(cfg)
+	// Init Engine
+	core := NewCore(cfg.RingSize, cfg.Lfast, cfg.Lslow, cfg.VarAlphaB, cfg.AlphaAbs, cfg.VarAlphaS, cfg.AlphaE)
+	engine := NewEngine(core)
 
-	// Hot loop: parse row, update model, write float64.
+	// Process
 	for i := 0; i < n; i++ {
 		off := i * RowSize
 		row := ParseAggRow(rawBytes[off : off+RowSize])
 
-		sig := st.Update(row)
+		tr := Trade{
+			Side:  TradeSign(row), // +1 or -1
+			Qty:   TradeQty(row),
+			Price: TradePrice(row),
+			Ts:    row.TsMs,
+		}
 
-		binary.LittleEndian.PutUint64((*binBuf)[i*8:], math.Float64bits(sig))
+		feats := engine.Update(tr)
+
+		baseOff := i * 40 // 5 * 8
+		binary.LittleEndian.PutUint64((*binBuf)[baseOff+0:], math.Float64bits(feats[0]))
+		binary.LittleEndian.PutUint64((*binBuf)[baseOff+8:], math.Float64bits(feats[1]))
+		binary.LittleEndian.PutUint64((*binBuf)[baseOff+16:], math.Float64bits(feats[2]))
+		binary.LittleEndian.PutUint64((*binBuf)[baseOff+24:], math.Float64bits(feats[3]))
+		binary.LittleEndian.PutUint64((*binBuf)[baseOff+32:], math.Float64bits(feats[4]))
 	}
 
-	if err := os.WriteFile(outPath, *binBuf, 0644); err != nil {
+	if err := os.WriteFile(outPath, *binBuf, 0o644); err != nil {
 		fmt.Printf("[err] write %s: %v\n", outPath, err)
 	}
 }
 
-// --- Data Loader (Same Binary Layout as data.go) ---
+// --- 5D Engine Core ---
 
-// loadRawDay decompresses one day's AGG3 blob and returns the raw rows buffer
-// (header stripped) and rowCount.
-func loadRawDay(y, m, d int) ([]byte, uint64, bool) {
-	dir := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", y), fmt.Sprintf("%02d", m))
-	idxPath := filepath.Join(dir, "index.quantdev")
-	dataPath := filepath.Join(dir, "data.quantdev")
-
-	offset, length := findBlobOffset(idxPath, d)
-	if length == 0 {
-		return nil, 0, false
-	}
-
-	f, err := os.Open(dataPath)
-	if err != nil {
-		return nil, 0, false
-	}
-	defer f.Close()
-
-	if _, err := f.Seek(int64(offset), io.SeekStart); err != nil {
-		return nil, 0, false
-	}
-
-	compData := make([]byte, length)
-	if _, err := io.ReadFull(f, compData); err != nil {
-		return nil, 0, false
-	}
-
-	r, err := zlib.NewReader(bytes.NewReader(compData))
-	if err != nil {
-		return nil, 0, false
-	}
-	raw, err := io.ReadAll(r)
-	r.Close()
-	if err != nil {
-		return nil, 0, false
-	}
-
-	if len(raw) < HeaderSize {
-		return nil, 0, false
-	}
-
-	rowCount := binary.LittleEndian.Uint64(raw[8:])
-	return raw[HeaderSize:], rowCount, true
+type Trade struct {
+	Side  float64
+	Qty   float64
+	Price float64
+	Ts    int64
 }
 
-// findBlobOffset reads the index file and returns (offset,length) for day d.
-func findBlobOffset(idxPath string, day int) (uint64, uint64) {
-	f, err := os.Open(idxPath)
-	if err != nil {
-		return 0, 0
-	}
-	defer f.Close()
+type WindowSnap struct {
+	Start      int
+	Count      int
+	B          float64
+	PriceFirst float64
+	PriceLast  float64
+}
 
-	hdr := make([]byte, 16)
-	if _, err := io.ReadFull(f, hdr); err != nil {
-		return 0, 0
+type SnapPair struct {
+	Fast WindowSnap
+	Slow WindowSnap
+}
+
+type Core struct {
+	N      int
+	idx    int64
+	filled bool
+
+	u     []float64
+	side  []float64
+	qty   []float64
+	price []float64
+	ts    []int64
+	info  []float64 // cumulative info-time
+
+	Lfast float64
+	Lslow float64
+
+	// EW Vars
+	EWVarBf   float64
+	EWVarBs   float64
+	VarAlphaB float64
+
+	// SFA
+	AbsBaseline float64
+	AlphaAbs    float64
+	EWVarS      float64
+	VarAlphaS   float64
+
+	// Elasticity
+	ERef   float64
+	AlphaE float64
+}
+
+func NewCore(N int, Lfast, Lslow, varAlphaB, alphaAbs, varAlphaS, alphaE float64) *Core {
+	return &Core{
+		N:         N,
+		u:         make([]float64, N),
+		side:      make([]float64, N),
+		qty:       make([]float64, N),
+		price:     make([]float64, N),
+		ts:        make([]int64, N),
+		info:      make([]float64, N),
+		Lfast:     Lfast,
+		Lslow:     Lslow,
+		VarAlphaB: varAlphaB,
+		AlphaAbs:  alphaAbs,
+		VarAlphaS: varAlphaS,
+		AlphaE:    alphaE,
 	}
-	if string(hdr[:4]) != IdxMagic {
-		return 0, 0
+}
+
+func (c *Core) Update(tr Trade) SnapPair {
+	slot := int(c.idx % int64(c.N))
+
+	// u_i = s_i * sqrt(V_i)
+	u := tr.Side * math.Sqrt(tr.Qty)
+
+	var prevInfo float64
+	if c.idx > 0 {
+		prevInfo = c.info[(c.idx-1)%int64(c.N)]
+	}
+	info := prevInfo + math.Abs(u)
+
+	c.u[slot] = u
+	c.side[slot] = tr.Side
+	c.qty[slot] = tr.Qty
+	c.price[slot] = tr.Price
+	c.ts[slot] = tr.Ts
+	c.info[slot] = info
+
+	c.idx++
+	if c.idx >= int64(c.N) {
+		c.filled = true
 	}
 
-	count := binary.LittleEndian.Uint64(hdr[8:])
-	row := make([]byte, 26)
+	return c.buildSnaps()
+}
 
-	for i := uint64(0); i < count; i++ {
-		if _, err := io.ReadFull(f, row); err != nil {
+func (c *Core) buildSnaps() SnapPair {
+	if c.idx == 0 {
+		return SnapPair{}
+	}
+	lastPos := int((c.idx - 1) % int64(c.N))
+	infoNow := c.info[lastPos]
+
+	var Bf, Bs float64
+	var countF, countS int
+	startF, startS := lastPos, lastPos
+
+	limit := c.N
+	if int64(limit) > c.idx {
+		limit = int(c.idx)
+	}
+
+	for k := 0; k < limit; k++ {
+		i := (lastPos - k + c.N) % c.N
+
+		// infoNow - info[i] = sum_{j=i+1..last} |u_j|
+		dist := infoNow - c.info[i]
+		if dist > c.Lslow {
 			break
 		}
-		if int(binary.LittleEndian.Uint16(row[0:])) == day {
-			return binary.LittleEndian.Uint64(row[2:]), binary.LittleEndian.Uint64(row[10:])
+
+		Bs += c.u[i]
+		countS++
+		startS = i
+
+		if dist <= c.Lfast {
+			Bf += c.u[i]
+			countF++
+			startF = i
 		}
 	}
-	return 0, 0
+
+	var fast, slow WindowSnap
+	if countF > 0 {
+		fast = WindowSnap{
+			Start:      startF,
+			Count:      countF,
+			B:          Bf,
+			PriceFirst: c.price[startF],
+			PriceLast:  c.price[lastPos],
+		}
+	}
+	if countS > 0 {
+		slow = WindowSnap{
+			Start:      startS,
+			Count:      countS,
+			B:          Bs,
+			PriceFirst: c.price[startS],
+			PriceLast:  c.price[lastPos],
+		}
+	}
+
+	if fast.Count > 0 {
+		diff2 := fast.B * fast.B
+		if c.EWVarBf == 0 {
+			c.EWVarBf = diff2
+		} else {
+			c.EWVarBf = (1-c.VarAlphaB)*c.EWVarBf + c.VarAlphaB*diff2
+		}
+	}
+	if slow.Count > 0 {
+		diff2 := slow.B * slow.B
+		if c.EWVarBs == 0 {
+			c.EWVarBs = diff2
+		} else {
+			c.EWVarBs = (1-c.VarAlphaB)*c.EWVarBs + c.VarAlphaB*diff2
+		}
+	}
+
+	return SnapPair{Fast: fast, Slow: slow}
 }
 
-// discoverTasks enumerates all (Y,M,D) from existing index files.
-func discoverTasks() []ofiTask {
-	root := filepath.Join(BaseDir, Symbol)
-	var tasks []ofiTask
+// --- Feature Engine ---
 
+type FeatureVector [5]float64
+
+type Engine struct {
+	Core *Core
+}
+
+func NewEngine(core *Core) *Engine {
+	return &Engine{Core: core}
+}
+
+func (e *Engine) Update(tr Trade) FeatureVector {
+	snaps := e.Core.Update(tr)
+	fSnap := snaps.Fast
+	sSnap := snaps.Slow
+
+	if fSnap.Count == 0 || sSnap.Count == 0 {
+		return FeatureVector{}
+	}
+
+	f1 := e.f1_Zfast(fSnap)
+	f2 := e.f2_SFA(fSnap)
+	f3 := e.f3_Elasticity(fSnap)
+	f4 := e.f4_Coherence(fSnap)
+	f5 := e.f5_Align(fSnap, sSnap, f4)
+
+	return FeatureVector{f1, f2, f3, f4, f5}
+}
+
+// f1: Normalized Imbalance (Fast)
+func (e *Engine) f1_Zfast(f WindowSnap) float64 {
+	scale := math.Sqrt(e.Core.EWVarBf + 1e-12)
+	return math.Tanh(f.B / (scale + 1e-12))
+}
+
+// f2: SFA (Surplus Flow vs Absorption)
+func (e *Engine) f2_SFA(f WindowSnap) float64 {
+	c := e.Core
+	B := f.B
+	absB := math.Abs(B)
+
+	if c.AbsBaseline == 0 {
+		c.AbsBaseline = absB
+	} else {
+		c.AbsBaseline = (1-c.AlphaAbs)*c.AbsBaseline + c.AlphaAbs*absB
+	}
+
+	surplus := absB - c.AbsBaseline
+	if surplus <= 0 {
+		return 0
+	}
+	S := math.Copysign(surplus, B)
+
+	diff2 := S * S
+	if c.EWVarS == 0 {
+		c.EWVarS = diff2
+	} else {
+		c.EWVarS = (1-c.VarAlphaS)*c.EWVarS + c.VarAlphaS*diff2
+	}
+	scale := math.Sqrt(c.EWVarS + 1e-12)
+	return math.Tanh(S / (scale + 1e-12))
+}
+
+// f3: Elasticity (dP / Flow)
+func (e *Engine) f3_Elasticity(f WindowSnap) float64 {
+	c := e.Core
+	dP := f.PriceLast - f.PriceFirst
+	Q := f.B
+	eMag := math.Abs(dP) / (math.Abs(Q) + 1e-12)
+
+	if c.ERef == 0 {
+		c.ERef = eMag
+	} else {
+		c.ERef = (1-c.AlphaE)*c.ERef + c.AlphaE*eMag
+	}
+
+	r := eMag / (c.ERef + 1e-12)
+	return math.Tanh(r)
+}
+
+// f4: Coherence (Entropy of Sign Process)
+func (e *Engine) f4_Coherence(f WindowSnap) float64 {
+	c := e.Core
+	N := f.Count
+	if N < 3 {
+		return 0
+	}
+
+	start := f.Start
+	var npp, npm, nmp, nmm float64
+	var cntP, cntM float64
+
+	prevIdx := start
+	prevSide := c.side[prevIdx]
+
+	for k := 1; k < N; k++ {
+		idx := (start + k) % c.N
+		curSide := c.side[idx]
+
+		if prevSide > 0 {
+			cntP++
+			if curSide > 0 {
+				npp++
+			} else {
+				npm++
+			}
+		} else {
+			cntM++
+			if curSide > 0 {
+				nmp++
+			} else {
+				nmm++
+			}
+		}
+
+		prevIdx = idx
+		prevSide = curSide
+	}
+
+	Ppp := npp / (npp + npm + 1e-12)
+	Ppm := 1.0 - Ppp
+	Pmp := nmp / (nmp + nmm + 1e-12)
+	Pmm := 1.0 - Pmp
+
+	piP := cntP / (float64(N-1) + 1e-12)
+	piM := 1.0 - piP
+
+	h := 0.0
+	if Ppp > 1e-9 {
+		h -= piP * Ppp * math.Log2(Ppp)
+	}
+	if Ppm > 1e-9 {
+		h -= piP * Ppm * math.Log2(Ppm)
+	}
+	if Pmp > 1e-9 {
+		h -= piM * Pmp * math.Log2(Pmp)
+	}
+	if Pmm > 1e-9 {
+		h -= piM * Pmm * math.Log2(Pmm)
+	}
+
+	C := 1.0 - h
+	if C < 0 {
+		C = 0
+	}
+	if C > 1 {
+		C = 1
+	}
+	return C
+}
+
+// f5: Alignment (Fast + Slow + Coherence)
+func (e *Engine) f5_Align(f, s WindowSnap, C float64) float64 {
+	c := e.Core
+
+	scaleF := math.Sqrt(c.EWVarBf + 1e-12)
+	scaleS := math.Sqrt(c.EWVarBs + 1e-12)
+
+	Zf := f.B / (scaleF + 1e-12)
+	Zs := s.B / (scaleS + 1e-12)
+
+	align := math.Tanh(Zf) * math.Tanh(Zs)
+	return C * align
+}
+
+// --- IO Helpers ---
+
+func discoverTasks(sym string) []ofiTask {
+	root := filepath.Join(BaseDir, sym)
+	var tasks []ofiTask
 	years, err := os.ReadDir(root)
 	if err != nil {
 		return tasks
@@ -1102,224 +1529,69 @@ func discoverTasks() []ofiTask {
 			if err != nil {
 				continue
 			}
-
-			hdr := make([]byte, 16)
-			if _, err := io.ReadFull(f, hdr); err != nil {
+			var hdr [16]byte
+			if _, err := io.ReadFull(f, hdr[:]); err != nil {
 				f.Close()
 				continue
 			}
-			if string(hdr[:4]) != IdxMagic {
-				f.Close()
-				continue
-			}
-
 			count := binary.LittleEndian.Uint64(hdr[8:])
-			row := make([]byte, 26)
+			var row [26]byte
+
 			for i := uint64(0); i < count; i++ {
-				if _, err := io.ReadFull(f, row); err != nil {
+				if _, err := io.ReadFull(f, row[:]); err != nil {
 					break
 				}
 				d := int(binary.LittleEndian.Uint16(row[0:]))
-				if d >= 1 && d <= 31 {
-					tasks = append(tasks, ofiTask{Y: y, M: m, D: d})
+				offset := int64(binary.LittleEndian.Uint64(row[2:]))
+				length := int64(binary.LittleEndian.Uint64(row[10:]))
+
+				if d >= 1 && d <= 31 && length > 0 {
+					tasks = append(tasks, ofiTask{
+						Y: y, M: m, D: d,
+						Offset: offset,
+						Length: length,
+					})
 				}
 			}
 			f.Close()
 		}
 	}
-
 	return tasks
 }
 
-type ofiTask struct{ Y, M, D int }
+func loadRawBlob(sym string, t ofiTask) ([]byte, uint64, bool) {
+	dataPath := filepath.Join(BaseDir, sym, fmt.Sprintf("%04d", t.Y), fmt.Sprintf("%02d", t.M), "data.quantdev")
 
-// --- Champion Model: Hawkes Adaptive ---------------------------------------
-
-// Hawkes2ScaleConfig: shared kernel parameters.
-type Hawkes2ScaleConfig struct {
-	TauFast, TauSlow, MuBuy, MuSell            float64
-	A_pp_fast, A_pm_fast, A_mp_fast, A_mm_fast float64
-	A_pp_slow, A_pm_slow, A_mp_slow, A_mm_slow float64
-	D0, VolLambda, ZScoreLambda, SquashScale   float64
-}
-
-type HawkesAdaptiveConfig struct {
-	HawkesCfg                        Hawkes2ScaleConfig
-	ActivityLambda, ActMid, ActSlope float64
-}
-
-type HawkesAdaptiveState struct {
-	base                                         Hawkes2ScaleConfig
-	lastTsMs                                     int64
-	eBuyFast, eSellFast                          float64
-	eBuySlow, eSellSlow                          float64
-	actLambda, actEWMA, actMid, actSlope, squash float64
-	vol                                          VolEWMA
-	z                                            ZScoreEWMA
-}
-
-func NewHawkesAdaptiveState(cfg HawkesAdaptiveConfig) *HawkesAdaptiveState {
-	return &HawkesAdaptiveState{
-		base:      cfg.HawkesCfg,
-		actLambda: cfg.ActivityLambda,
-		actMid:    cfg.ActMid,
-		actSlope:  cfg.ActSlope,
-		squash:    cfg.HawkesCfg.SquashScale,
-		vol:       VolEWMA{Lambda: cfg.HawkesCfg.VolLambda},
-		z:         ZScoreEWMA{Lambda: cfg.HawkesCfg.ZScoreLambda},
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return nil, 0, false
 	}
-}
+	defer f.Close()
 
-func (st *HawkesAdaptiveState) Update(row AggRow) float64 {
-	ts := row.TsMs
-	d := TradeDollar(row)
-	s := TradeSign(row)
-	px := TradePrice(row)
-
-	// dt in seconds
-	var dtSec float64
-	if st.lastTsMs == 0 {
-		st.lastTsMs = ts
-		dtSec = 0
-	} else {
-		dtSec = float64(ts-st.lastTsMs) / 1000.0
-		if dtSec < 0 {
-			dtSec = 0
-		}
-		st.lastTsMs = ts
+	if _, err := f.Seek(t.Offset, io.SeekStart); err != nil {
+		return nil, 0, false
 	}
 
-	// Activity EWMA + Hawkes decay
-	if dtSec > 0 {
-		st.actEWMA = st.actLambda*st.actEWMA + (1-st.actLambda)*(1.0/dtSec)
-
-		df := math.Exp((-1.0 / st.base.TauFast) * dtSec)
-		ds := math.Exp((-1.0 / st.base.TauSlow) * dtSec)
-
-		st.eBuyFast *= df
-		st.eSellFast *= df
-		st.eBuySlow *= ds
-		st.eSellSlow *= ds
+	compData := make([]byte, t.Length)
+	if _, err := io.ReadFull(f, compData); err != nil {
+		return nil, 0, false
 	}
 
-	// Log-saturated mark on dollar flow (uses Log1p for precision).
-	mark := 0.0
-	if d > 0 && st.base.D0 > 0 {
-		mark = math.Log1p(d / st.base.D0)
+	r, err := zlib.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		return nil, 0, false
+	}
+	raw, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		return nil, 0, false
 	}
 
-	// Signed excitation update.
-	if s > 0 {
-		st.eBuyFast += mark
-		st.eBuySlow += mark
-	} else {
-		st.eSellFast += mark
-		st.eSellSlow += mark
+	if len(raw) < HeaderSize {
+		return nil, 0, false
 	}
-
-	// Fast kernel intensities.
-	bf := st.base.MuBuy + st.base.A_pp_fast*st.eBuyFast + st.base.A_pm_fast*st.eSellFast
-	sf := st.base.MuSell + st.base.A_mp_fast*st.eBuyFast + st.base.A_mm_fast*st.eSellFast
-
-	// Slow kernel intensities.
-	bs := st.base.MuBuy + st.base.A_pp_slow*st.eBuySlow + st.base.A_pm_slow*st.eSellSlow
-	ss := st.base.MuSell + st.base.A_mp_slow*st.eBuySlow + st.base.A_mm_slow*st.eSellSlow
-
-	// Activity-based slow weight (higher activity -> lower slow weight).
-	wSlow := 0.5
-	if st.actEWMA > 0 {
-		x := (math.Log(st.actEWMA+1e-9) - math.Log(st.actMid+1e-9)) * st.actSlope
-		wSlow = 1.0 / (1.0 + math.Exp(x))
-	}
-	if wSlow < 0 {
-		wSlow = 0
-	} else if wSlow > 1 {
-		wSlow = 1
-	}
-	wFast := 1.0 - wSlow
-
-	buy := wFast*bf + wSlow*bs
-	sell := wFast*sf + wSlow*ss
-	if buy < 0 {
-		buy = 0
-	}
-	if sell < 0 {
-		sell = 0
-	}
-
-	// Directional imbalance.
-	imb := 0.0
-	if den := buy + sell; den > 1e-12 {
-		imb = (buy - sell) / den
-	}
-
-	// Vol normalization and z-scoring.
-	st.vol.Update(px)
-	sigma := st.vol.Sigma()
-	if sigma <= 0 {
-		sigma = 1
-	}
-
-	zVal := st.z.Update(imb / sigma)
-	return Squash(zVal, st.squash)
-}
-
-// --- Shared EWMA Helpers ----------------------------------------------------
-
-type VolEWMA struct {
-	Lambda  float64
-	VarEwma float64
-	LastPx  float64
-	HasLast bool
-}
-
-func (v *VolEWMA) Update(price float64) {
-	if !v.HasLast {
-		v.LastPx = price
-		v.HasLast = true
-		return
-	}
-	if price <= 0 {
-		return
-	}
-	r := math.Log(price / v.LastPx)
-	v.LastPx = price
-	v.VarEwma = v.Lambda*v.VarEwma + (1-v.Lambda)*r*r
-}
-
-func (v *VolEWMA) Sigma() float64 {
-	if v.VarEwma <= 0 {
-		return 0
-	}
-	return math.Sqrt(v.VarEwma)
-}
-
-type ZScoreEWMA struct {
-	Lambda float64
-	Mean   float64
-	Var    float64
-	Warmed bool
-}
-
-func (z *ZScoreEWMA) Update(x float64) float64 {
-	if !z.Warmed {
-		z.Mean = x
-		z.Var = 0
-		z.Warmed = true
-		return 0
-	}
-	mPrev := z.Mean
-	z.Mean = z.Lambda*z.Mean + (1-z.Lambda)*x
-	dx := x - mPrev
-	z.Var = z.Lambda*z.Var + (1-z.Lambda)*dx*dx
-	if z.Var <= 0 {
-		return 0
-	}
-	return (x - z.Mean) / math.Sqrt(z.Var)
-}
-
-func Squash(x, scale float64) float64 {
-	return math.Tanh(scale * x)
+	rowCount := binary.LittleEndian.Uint64(raw[8:])
+	return raw[HeaderSize:], rowCount, true
 }
 ```
 
@@ -1331,9 +1603,12 @@ func Squash(x, scale float64) float64 {
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"iter"
 	"math"
 	"os"
 	"path/filepath"
@@ -1345,10 +1620,10 @@ import (
 	"time"
 )
 
-// --- Study Config ---
+// --- Configuration ---
+
 const (
 	OOSDateStr   = "2024-01-01"
-	StudyThreads = 24
 	StudyMaxRows = 10_000_000
 )
 
@@ -1359,77 +1634,94 @@ func init() {
 	oosBoundaryYMD = parseOOSBoundary(OOSDateStr)
 }
 
-// DayResult carries raw Moments instead of final Stats
 type DayResult struct {
-	YMD     int
-	Moments [][]Moments // [Variant][Horizon]
+	YMD int
+	// Metrics[VariantName][HorizonIdx]
+	// If a file is 5D, we produce 5 virtual variants: "Var_f1", "Var_f2", ...
+	Metrics map[string][]Moments
 }
+
+// --- Main Logic ---
 
 func runStudy() {
 	startT := time.Now()
-	featRoot := filepath.Join(BaseDir, "features", Symbol)
 
-	// 1. Discover Variants
+	symbols := discoverFeatureSymbols()
+	fmt.Printf("--- STUDY | Found Feature Sets: %v ---\n", symbols)
+
+	for _, sym := range symbols {
+		studySymbol(sym)
+	}
+
+	fmt.Printf("[study] ALL COMPLETE in %s\n", time.Since(startT))
+}
+
+func discoverFeatureSymbols() []string {
+	var syms []string
+	featDir := filepath.Join(BaseDir, "features")
+	entries, err := os.ReadDir(featDir)
+	if err != nil {
+		return syms
+	}
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			syms = append(syms, e.Name())
+		}
+	}
+	return syms
+}
+
+func studySymbol(sym string) {
+	fmt.Printf("\n>>> STUDY: %s <<<\n", sym)
+	featRoot := filepath.Join(BaseDir, "features", sym)
+
 	entries, err := os.ReadDir(featRoot)
 	if err != nil {
-		fmt.Printf("[err] reading feature dir: %v\n", err)
 		return
 	}
 	var variants []string
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
 			variants = append(variants, e.Name())
 		}
 	}
 	slices.Sort(variants)
+
 	if len(variants) == 0 {
-		fmt.Println("[warn] No variants found.")
 		return
 	}
 
-	fmt.Printf("--- OFI STUDY | %s | %d Variants | Split: %s ---\n", Symbol, len(variants), OOSDateStr)
-
-	// 2. Discover Common Days
 	tasks := discoverStudyDays(filepath.Join(featRoot, variants[0]))
-	fmt.Printf("[job] Processing %d days using %d threads.\n", len(tasks), StudyThreads)
+	fmt.Printf("Variants: %d | Days: %d\n", len(variants), len(tasks))
 
-	// 3. Global Accumulators: [Variant][Horizon]
-	isAcc := make([][]Moments, len(variants))
-	oosAcc := make([][]Moments, len(variants))
-	for i := range variants {
-		isAcc[i] = make([]Moments, len(TimeHorizonsSec))
-		oosAcc[i] = make([]Moments, len(TimeHorizonsSec))
-	}
+	// Accumulators: Map[FeatureKey] -> [Horizon]Moments
+	isAcc := make(map[string][]Moments)
+	oosAcc := make(map[string][]Moments)
 
-	// Track Day Counts for display
-	isDays := 0
-	oosDays := 0
+	// Daily ICs for t-stat: Map[FeatureKey][HorizonIdx] -> []IC
+	isDailyIC := make(map[string]map[int][]float64)
+	oosDailyIC := make(map[string]map[int][]float64)
 
-	// 4. Parallel Pipeline
+	var accMu sync.Mutex
+
 	resultsChan := make(chan DayResult, 64)
 	jobsChan := make(chan int, len(tasks))
 	var wg sync.WaitGroup
 
-	for i := 0; i < StudyThreads; i++ {
+	for i := 0; i < CPUThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
-			// Thread-local allocation
-			maxRows := StudyMaxRows
-			prices := make([]float64, maxRows)
-			times := make([]int64, maxRows)
-			sigBuf := make([]float64, maxRows)
-			scratchSig := make([]float64, 0, maxRows)
-			scratchRet := make([]float64, 0, maxRows)
-			fileBuf := make([]byte, maxRows*8)
+			// Buffers reused per thread
+			prices := make([]float64, StudyMaxRows)
+			times := make([]int64, StudyMaxRows)
+			sigBuf := make([]float64, StudyMaxRows*5) // up to 5D
+			fileBuf := make([]byte, StudyMaxRows*5*8)
 
 			for idx := range jobsChan {
-				dayInt := tasks[idx]
 				res := processStudyDay(
-					dayInt, variants, featRoot,
-					prices, times, sigBuf, fileBuf,
-					&scratchSig, &scratchRet,
+					sym, tasks[idx], variants, featRoot,
+					&prices, &times, &sigBuf, &fileBuf,
 				)
 				resultsChan <- res
 			}
@@ -1446,240 +1738,280 @@ func runStudy() {
 		close(resultsChan)
 	}()
 
-	// 5. Aggregation (Main Thread)
+	isDays, oosDays := 0, 0
+
 	for res := range resultsChan {
-		if len(res.Moments) == 0 {
+		if len(res.Metrics) == 0 {
 			continue
 		}
 		isOOS := res.YMD >= oosBoundaryYMD
-
 		if isOOS {
 			oosDays++
 		} else {
 			isDays++
 		}
 
-		for vIdx := range variants {
+		accMu.Lock()
+		for vName, moms := range res.Metrics {
+			// Ensure accumulators exist
+			if _, ok := isAcc[vName]; !ok {
+				isAcc[vName] = make([]Moments, len(TimeHorizonsSec))
+				oosAcc[vName] = make([]Moments, len(TimeHorizonsSec))
+			}
+			if _, ok := isDailyIC[vName]; !ok {
+				isDailyIC[vName] = make(map[int][]float64)
+				oosDailyIC[vName] = make(map[int][]float64)
+			}
+
+			target := isAcc[vName]
+			icMap := isDailyIC[vName]
+			if isOOS {
+				target = oosAcc[vName]
+				icMap = oosDailyIC[vName]
+			}
+
 			for hIdx := range TimeHorizonsSec {
-				m := res.Moments[vIdx][hIdx]
-				if m.Count > 0 {
-					if isOOS {
-						oosAcc[vIdx][hIdx].Add(m)
-					} else {
-						isAcc[vIdx][hIdx].Add(m)
-					}
+				m := moms[hIdx]
+				if m.Count <= 0 {
+					continue
 				}
+
+				// Aggregate Moments
+				target[hIdx].Add(m)
+
+				// Per-day IC for stability T-stat:
+				// IC = Corr(signal, return) using this day's Moments m
+				num := m.Count*m.SumProd - m.SumSig*m.SumRet
+				denX := m.Count*m.SumSqSig - m.SumSig*m.SumSig
+				denY := m.Count*m.SumSqRet - m.SumRet*m.SumRet
+				den := denX * denY
+
+				ic := 0.0
+				if den > 0 {
+					ic = num / math.Sqrt(den)
+				}
+
+				icMap[hIdx] = append(icMap[hIdx], ic)
 			}
 		}
+		accMu.Unlock()
 	}
 
-	// 6. Reporting
-	fmt.Println()
-	approxIS := isDays
-	approxOOS := oosDays
+	// Collect feature keys
+	var finalKeys []string
+	for k := range isAcc {
+		finalKeys = append(finalKeys, k)
+	}
+	sort.Strings(finalKeys)
 
 	for hIdx, sec := range TimeHorizonsSec {
-		printHorizonTable(sec, variants, isAcc, oosAcc, hIdx, approxIS, approxOOS)
+		printHorizonTable(
+			sec,
+			finalKeys,
+			isAcc, oosAcc,
+			isDailyIC, oosDailyIC,
+			hIdx,
+			isDays, oosDays,
+		)
 		fmt.Println()
 	}
-
-	fmt.Printf("[study] Complete in %s\n", time.Since(startT))
 }
 
+// Per-day processing: load raw agg data, load 1D/5D features, and
+// compute Moments per feature/horizon.
 func processStudyDay(
+	sym string,
 	dayInt int,
 	variants []string,
 	featRoot string,
-	prices []float64,
-	times []int64,
-	sigBuf []float64,
-	fileBuf []byte,
-	scratchSig, scratchRet *[]float64,
+	prices *[]float64,
+	times *[]int64,
+	sigBuf *[]float64,
+	fileBuf *[]byte,
 ) DayResult {
 	y, m, d := dayInt/10000, (dayInt%10000)/100, dayInt%100
+	res := DayResult{YMD: dayInt, Metrics: make(map[string][]Moments)}
 
-	res := DayResult{
-		YMD:     dayInt,
-		Moments: make([][]Moments, len(variants)),
-	}
-
-	rawBytes, rowCount, ok := loadRawDay(y, m, d)
+	rawBytes, rowCount, ok := loadRawDay(sym, y, m, d)
 	if !ok || rowCount == 0 {
 		return res
 	}
 	n := int(rowCount)
 
-	// Buffer management
-	if n > cap(prices) {
-		newCap := n + n/4
-		prices = make([]float64, newCap)
-		times = make([]int64, newCap)
-		sigBuf = make([]float64, newCap)
+	if n > cap(*prices) {
+		*prices = make([]float64, n+n/4)
 	}
-	if n*8 > cap(fileBuf) {
-		fileBuf = make([]byte, n*8+1024)
-	}
-	if n > cap(*scratchSig) {
-		*scratchSig = make([]float64, 0, n)
-		*scratchRet = make([]float64, 0, n)
+	if n > cap(*times) {
+		*times = make([]int64, n+n/4)
 	}
 
-	prices = prices[:n]
-	times = times[:n]
-	sigBuf = sigBuf[:n]
+	p := (*prices)[:n]
+	t := (*times)[:n]
 
-	// Parse Raw (Vectorized)
 	for i := 0; i < n; i++ {
 		off := i * RowSize
-		prices[i] = float64(binary.LittleEndian.Uint64(rawBytes[off+8:]))
-		times[i] = int64(binary.LittleEndian.Uint64(rawBytes[off+38:]))
+		p[i] = float64(binary.LittleEndian.Uint64(rawBytes[off+8:]))
+		t[i] = int64(binary.LittleEndian.Uint64(rawBytes[off+38:]))
 	}
 
 	dStr := fmt.Sprintf("%04d%02d%02d", y, m, d)
 
-	for vIdx, v := range variants {
+	for _, v := range variants {
 		sigPath := filepath.Join(featRoot, v, dStr+".bin")
-		loadedSigs, ok := fastLoadFloats(sigPath, fileBuf, sigBuf)
 
-		res.Moments[vIdx] = make([]Moments, len(TimeHorizonsSec))
-
-		if !ok || len(loadedSigs) != n {
+		rawSigs, byteSize, ok := fastLoadBytes(sigPath, fileBuf)
+		if !ok {
 			continue
 		}
 
-		for hIdx, sec := range TimeHorizonsSec {
-			prepSig, prepRet := prepareVectors(loadedSigs, prices, times, sec*1000, scratchSig, scratchRet)
-			res.Moments[vIdx][hIdx] = CalcMoments(prepSig, prepRet)
+		if n == 0 {
+			continue
+		}
+		if byteSize%(n*8) != 0 {
+			continue
+		}
+		dims := byteSize / (n * 8)
+		if dims < 1 || dims > 5 {
+			continue
+		}
+
+		if n > cap(*sigBuf) {
+			*sigBuf = make([]float64, n+n/4)
+		}
+
+		featureNames := []string{"f1_Z", "f2_SFA", "f3_Elast", "f4_Coh", "f5_Align"}
+
+		for dim := 0; dim < dims; dim++ {
+			target := (*sigBuf)[:n]
+
+			for i := 0; i < n; i++ {
+				offset := (i*dims + dim) * 8
+				bits := binary.LittleEndian.Uint64(rawSigs[offset:])
+				target[i] = math.Float64frombits(bits)
+			}
+
+			key := v
+			if dims > 1 {
+				suffix := fmt.Sprintf("_d%d", dim+1)
+				if dim < len(featureNames) {
+					suffix = "_" + featureNames[dim]
+				}
+				key = v + suffix
+			}
+
+			moms := make([]Moments, len(TimeHorizonsSec))
+			for hIdx, sec := range TimeHorizonsSec {
+				seq := AlignVectors(target, p, t, sec*1000)
+				moms[hIdx] = CalcMomentsStream(seq)
+			}
+			res.Metrics[key] = moms
 		}
 	}
 	return res
 }
 
-func prepareVectors(
-	sig, prices []float64,
-	times []int64,
-	horizonMs int,
-	scratchSig, scratchRet *[]float64,
-) ([]float64, []float64) {
-	n := len(sig)
-	vSig := (*scratchSig)[:0]
-	vRet := (*scratchRet)[:0]
+// AlignVectors: aligns signal with future returns at horizon hMs.
+func AlignVectors(sig, prices []float64, times []int64, hMs int) iter.Seq2[float64, float64] {
+	return func(yield func(float64, float64) bool) {
+		n := len(sig)
+		j := 0
+		hVal := int64(hMs)
 
-	j := 0
-	hVal := int64(horizonMs)
+		for i := 0; i < n; i++ {
+			s := sig[i]
+			if s == 0 {
+				continue
+			}
 
-	for i := 0; i < n; i++ {
-		pStart := prices[i]
-		s := sig[i]
-		if pStart <= 0 || s == 0 {
-			continue
-		}
+			pStart := prices[i]
+			if pStart <= 0 {
+				continue
+			}
 
-		tTarget := times[i] + hVal
+			tTarget := times[i] + hVal
+			if j < i+1 {
+				j = i + 1
+			}
 
-		if j < i+1 {
-			j = i + 1
-		}
-		for j < n && times[j] < tTarget {
-			j++
-		}
-		if j >= n {
-			break
-		}
+			for j < n && times[j] < tTarget {
+				j++
+			}
+			if j >= n {
+				break
+			}
 
-		pEnd := prices[j]
-		if pEnd > 0 {
-			vSig = append(vSig, s)
-			vRet = append(vRet, (pEnd-pStart)/pStart)
+			pEnd := prices[j]
+			if pEnd > 0 {
+				r := (pEnd - pStart) / pStart
+				if !yield(s, r) {
+					return
+				}
+			}
 		}
 	}
-
-	return vSig, vRet
 }
 
-func fastLoadFloats(path string, fileBuf []byte, outBuf []float64) ([]float64, bool) {
+// Loads full file into buffer, returns slice and total size in bytes.
+func fastLoadBytes(path string, fileBuf *[]byte) ([]byte, int, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, false
+		return nil, 0, false
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, false
+		return nil, 0, false
 	}
 	size := int(fi.Size())
-	if size <= 0 || size%8 != 0 {
-		return nil, false
-	}
-	count := size / 8
-
-	if count > cap(outBuf) {
-		outBuf = make([]float64, count)
-	} else {
-		outBuf = outBuf[:count]
+	if size == 0 {
+		return nil, 0, false
 	}
 
-	if cap(fileBuf) < size {
-		fileBuf = make([]byte, size)
+	if cap(*fileBuf) < size {
+		*fileBuf = make([]byte, size)
 	}
-	fileBuf = fileBuf[:size]
+	buf := (*fileBuf)[:size]
 
-	if _, err := io.ReadFull(f, fileBuf); err != nil {
-		return nil, false
-	}
-
-	for i := 0; i < count; i++ {
-		outBuf[i] = math.Float64frombits(binary.LittleEndian.Uint64(fileBuf[i*8:]))
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return nil, 0, false
 	}
 
-	return outBuf, true
+	return buf, size, true
 }
+
+// --- Output / helpers ---
 
 func printHorizonTable(
 	sec int,
-	variants []string,
-	isAcc, oosAcc [][]Moments,
+	keys []string,
+	isAcc, oosAcc map[string][]Moments,
+	isDailyIC, oosDailyIC map[string]map[int][]float64,
 	hIdx, isDays, oosDays int,
 ) {
-	type row struct {
-		Name string
-		IS   MetricStats
-		OOS  MetricStats
-	}
-	var rows []row
-
-	for vIdx, v := range variants {
-		rows = append(rows, row{
-			Name: v,
-			IS:   FinalizeMetrics(isAcc[vIdx][hIdx]),
-			OOS:  FinalizeMetrics(oosAcc[vIdx][hIdx]),
-		})
-	}
-
-	slices.SortFunc(rows, func(a, b row) int {
-		if a.OOS.Sharpe > b.OOS.Sharpe {
-			return -1
-		}
-		if a.OOS.Sharpe < b.OOS.Sharpe {
-			return 1
-		}
-		return 0
-	})
-
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	// --- FIX: Use isDays and oosDays in the header ---
-	fmt.Fprintf(w, "== Horizon %d sec [IS: %d days | OOS: %d days] ==\n", sec, isDays, oosDays)
-	fmt.Fprintln(w, "VARIANT\tIS_IC\tOOS_IC\tIS_SR(Tr)\tOOS_SR(Tr)\tIS_HIT\tOOS_HIT\tIS_BE\tOOS_BE")
-	fmt.Fprintln(w, "-------\t-----\t------\t---------\t----------\t------\t-------\t-----\t------")
+	fmt.Fprintf(w, "== Horizon %ds [IS: %d | OOS: %d] ==\n", sec, isDays, oosDays)
+	fmt.Fprintln(w, "FEATURE\tIS_IC\tIS_T\tOOS_IC\tOOS_T\tAC(Lag1)\tBPS/TR")
 
-	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.1f%%\t%.1f%%\t%.1f\t%.1f\n",
-			r.Name,
-			r.IS.ICPearson, r.OOS.ICPearson,
-			r.IS.Sharpe, r.OOS.Sharpe,
-			r.IS.HitRate*100, r.OOS.HitRate*100,
-			r.IS.BreakevenBps, r.OOS.BreakevenBps,
+	for _, k := range keys {
+		// Guard against missing IC slices
+		var isICSlice, oosICSlice []float64
+		if m, ok := isDailyIC[k]; ok {
+			isICSlice = m[hIdx]
+		}
+		if m, ok := oosDailyIC[k]; ok {
+			oosICSlice = m[hIdx]
+		}
+
+		is := FinalizeMetrics(isAcc[k][hIdx], isICSlice)
+		oos := FinalizeMetrics(oosAcc[k][hIdx], oosICSlice)
+
+		fmt.Fprintf(w, "%s\t%.4f\t%.2f\t%.4f\t%.2f\t%.3f\t%.2f\n",
+			k,
+			is.ICPearson, is.IC_TStat,
+			oos.ICPearson, oos.IC_TStat,
+			is.AutoCorr,
+			is.BreakevenBps,
 		)
 	}
 	w.Flush()
@@ -1690,26 +2022,90 @@ func discoverStudyDays(vDir string) []int {
 	files, _ := os.ReadDir(vDir)
 	for _, f := range files {
 		if strings.HasSuffix(f.Name(), ".bin") {
-			name := strings.TrimSuffix(f.Name(), ".bin")
-			if len(name) == 8 {
-				if val := fastAtoi(name); val > 0 {
-					days = append(days, val)
-				}
+			if val := fastAtoi(strings.TrimSuffix(f.Name(), ".bin")); val > 0 {
+				days = append(days, val)
 			}
 		}
 	}
 	sort.Ints(days)
 	return days
 }
+
 func parseOOSBoundary(d string) int {
 	return fastAtoi(d[0:4])*10000 + fastAtoi(d[5:7])*100 + fastAtoi(d[8:10])
 }
+
 func fastAtoi(s string) int {
 	n := 0
 	for i := 0; i < len(s); i++ {
-		n = n*10 + int(s[i]-'0')
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			n = n*10 + int(c-'0')
+		}
 	}
 	return n
+}
+
+func loadRawDay(sym string, y, m, d int) ([]byte, uint64, bool) {
+	dir := filepath.Join(BaseDir, sym, fmt.Sprintf("%04d", y), fmt.Sprintf("%02d", m))
+	idxPath := filepath.Join(dir, "index.quantdev")
+	dataPath := filepath.Join(dir, "data.quantdev")
+
+	offset, length := findBlobOffset(idxPath, d)
+	if length == 0 {
+		return nil, 0, false
+	}
+
+	f, err := os.Open(dataPath)
+	if err != nil {
+		return nil, 0, false
+	}
+	defer f.Close()
+
+	if _, err := f.Seek(int64(offset), io.SeekStart); err != nil {
+		return nil, 0, false
+	}
+	compData := make([]byte, length)
+	if _, err := io.ReadFull(f, compData); err != nil {
+		return nil, 0, false
+	}
+	r, err := zlib.NewReader(bytes.NewReader(compData))
+	if err != nil {
+		return nil, 0, false
+	}
+	raw, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		return nil, 0, false
+	}
+	if len(raw) < HeaderSize {
+		return nil, 0, false
+	}
+	rowCount := binary.LittleEndian.Uint64(raw[8:])
+	return raw[HeaderSize:], rowCount, true
+}
+
+func findBlobOffset(idxPath string, day int) (uint64, uint64) {
+	f, err := os.Open(idxPath)
+	if err != nil {
+		return 0, 0
+	}
+	defer f.Close()
+	var hdr [16]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return 0, 0
+	}
+	count := binary.LittleEndian.Uint64(hdr[8:])
+	var row [26]byte
+	for i := uint64(0); i < count; i++ {
+		if _, err := io.ReadFull(f, row[:]); err != nil {
+			break
+		}
+		if int(binary.LittleEndian.Uint16(row[0:])) == day {
+			return binary.LittleEndian.Uint64(row[2:]), binary.LittleEndian.Uint64(row[10:])
+		}
+	}
+	return 0, 0
 }
 ```
 
@@ -1732,10 +2128,15 @@ import (
 	"sync"
 )
 
-// runSanity verifies that all month-level data/index files are structurally sound
-// and that checksums and basic header/length invariants hold.
+// runSanity scans all months for the currently active Symbol() and validates
+// that index.quantdev and data.quantdev are consistent, including:
+//   - presence of both files
+//   - index header magic and row count
+//   - compressed blobs readable and checksummed
+//   - AGG3 header present and valid
+//   - AGG3 body length matches HeaderSize + rowCount*RowSize
 func runSanity() {
-	root := filepath.Join(BaseDir, Symbol)
+	root := filepath.Join(BaseDir, Symbol())
 	dirs, err := os.ReadDir(root)
 	if err != nil {
 		fmt.Printf("SANITY: cannot read root %s: %v\n", root, err)
@@ -1753,13 +2154,17 @@ func runSanity() {
 			continue
 		}
 		for _, m := range months {
-			if m.IsDir() {
-				tasks = append(tasks, filepath.Join(root, y.Name(), m.Name()))
+			if !m.IsDir() {
+				continue
 			}
+			tasks = append(tasks, filepath.Join(root, y.Name(), m.Name()))
 		}
 	}
 
-	fmt.Printf("SANITY CHECK: %s (%d months)\n", Symbol, len(tasks))
+	fmt.Printf("SANITY CHECK: %s (%d months)\n", Symbol(), len(tasks))
+	if len(tasks) == 0 {
+		return
+	}
 
 	var wg sync.WaitGroup
 	jobs := make(chan string, len(tasks))
@@ -1799,28 +2204,25 @@ func validateMonth(dir string) {
 	}
 	defer fData.Close()
 
-	hdr := make([]byte, 16)
-	if _, err := io.ReadFull(fIdx, hdr); err != nil {
-		fmt.Printf("FAIL: %s (Index header read error: %v)\n", dir, err)
+	var hdr [16]byte
+	if _, err := io.ReadFull(fIdx, hdr[:]); err != nil {
+		fmt.Printf("FAIL: %s (Header Read Error: %v)\n", dir, err)
 		return
 	}
-
 	if string(hdr[:4]) != IdxMagic {
-		fmt.Printf("FAIL: %s (Bad index magic)\n", dir)
+		fmt.Printf("FAIL: %s (Bad Index Magic)\n", dir)
 		return
 	}
 
 	count := binary.LittleEndian.Uint64(hdr[8:])
-	row := make([]byte, 26)
-	issues := 0
+	var row [26]byte
 
+	issues := 0
 	for i := uint64(0); i < count; i++ {
-		if _, err := io.ReadFull(fIdx, row); err != nil {
-			fmt.Printf("FAIL: %s (Index row read error at %d: %v)\n", dir, i, err)
+		if _, err := io.ReadFull(fIdx, row[:]); err != nil {
 			issues++
 			break
 		}
-
 		offset := int64(binary.LittleEndian.Uint64(row[2:]))
 		length := int(binary.LittleEndian.Uint64(row[10:]))
 		expSum := binary.LittleEndian.Uint64(row[18:])
@@ -1830,12 +2232,12 @@ func validateMonth(dir string) {
 			continue
 		}
 
-		// Read compressed blob
-		compData := make([]byte, length)
 		if _, err := fData.Seek(offset, io.SeekStart); err != nil {
 			issues++
 			continue
 		}
+
+		compData := make([]byte, length)
 		if _, err := io.ReadFull(fData, compData); err != nil {
 			issues++
 			continue
@@ -1853,28 +2255,27 @@ func validateMonth(dir string) {
 			continue
 		}
 
-		// Check checksum
+		// Check checksum of full AGG3 blob.
 		s := sha256.Sum256(aggBlob)
 		if binary.LittleEndian.Uint64(s[:8]) != expSum {
 			issues++
 			continue
 		}
 
-		// Basic structural checks
+		// Validate AGG3 header.
 		if len(aggBlob) < HeaderSize {
 			issues++
 			continue
 		}
-
-		// Validate header magic
 		if string(aggBlob[:4]) != AggMagic {
 			issues++
 			continue
 		}
 
-		rowCount := binary.LittleEndian.Uint64(aggBlob[8:])
-		expectedLen := HeaderSize + int(rowCount)*RowSize
-		if expectedLen != len(aggBlob) {
+		// Optional but stronger check: rowCount vs length.
+		rowCount := binary.LittleEndian.Uint64(aggBlob[8:16])
+		expectedSize := HeaderSize + int(rowCount)*RowSize
+		if expectedSize != len(aggBlob) {
 			issues++
 			continue
 		}

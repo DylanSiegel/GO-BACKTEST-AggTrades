@@ -8,7 +8,6 @@ import (
 )
 
 func main() {
-	// Hardware Optimization: Ryzen 9 7900X
 	runtime.GOMAXPROCS(CPUThreads)
 
 	if len(os.Args) < 2 {
@@ -17,17 +16,24 @@ func main() {
 	}
 
 	start := time.Now()
+
+	fmt.Printf("Go 1.25.4 | Env: %s/%s | Threads: %d | GOGC: %s | AMD64: %s\n",
+		runtime.GOOS, runtime.GOARCH,
+		runtime.GOMAXPROCS(0),
+		os.Getenv("GOGC"),
+		os.Getenv("GOAMD64"))
+
 	cmd := os.Args[1]
 
 	switch cmd {
 	case "data":
-		runData() // Download
+		runData()
 	case "build":
-		runBuild() // Run Models -> .bin
+		runBuild()
 	case "study":
-		runStudy() // IS/OOS Stats
+		runStudy()
 	case "sanity":
-		runSanity() // Integrity Check
+		runSanity()
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 		printHelp()

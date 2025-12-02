@@ -1,34 +1,37 @@
 package main
 
-import "math"
+import (
+	"iter"
+	"math"
+	"sort"
+)
 
-// MetricStats holds the final calculated metrics for human consumption.
 type MetricStats struct {
 	Count        int
-	ICPearson    float64 // Linear IC
-	Sharpe       float64 // Per-trade Sharpe
-	SharpeAnnual float64 // t-statistic (Sharpe * sqrt(N))
-	HitRate      float64 // Directional accuracy
-	BreakevenBps float64 // Cost per unit turnover to zero PnL
+	ICPearson    float64
+	IC_TStat     float64 // Stability
+	Sharpe       float64
+	HitRate      float64
+	BreakevenBps float64
+	AutoCorr     float64 // Lag-1 Autocorrelation (Corrected)
 }
 
-// Moments holds raw sums for global aggregation (IC, Sharpe, Turnover).
-// Optimized for memory alignment on amd64.
 type Moments struct {
-	Count     float64
-	SumSig    float64
-	SumRet    float64
-	SumProd   float64 // Sum(Sig * Ret)
-	SumSqSig  float64
-	SumSqRet  float64
-	SumPnL    float64
-	SumSqPnL  float64
-	Hits      float64
-	ValidHits float64
-	Turnover  float64
+	Count       float64
+	SumSig      float64
+	SumRet      float64
+	SumProd     float64
+	SumSqSig    float64
+	SumSqRet    float64
+	SumPnL      float64
+	SumSqPnL    float64
+	Hits        float64
+	ValidHits   float64
+	Turnover    float64
+	SumProdLag  float64 // Σ(S_t * S_{t-1})
+	SumSqSigLag float64 // Σ(S_{t-1}^2) (Not strictly needed for centered approx, but kept)
 }
 
-// Add accumulates m2 into m (In-place).
 func (m *Moments) Add(m2 Moments) {
 	m.Count += m2.Count
 	m.SumSig += m2.SumSig
@@ -41,87 +44,63 @@ func (m *Moments) Add(m2 Moments) {
 	m.Hits += m2.Hits
 	m.ValidHits += m2.ValidHits
 	m.Turnover += m2.Turnover
+	m.SumProdLag += m2.SumProdLag
+	m.SumSqSigLag += m2.SumSqSigLag
 }
 
-// CalcMoments computes raw moments for a single chunk/day.
-// Optimized for AVX2 pipeline (simple float operations, branch-light).
-func CalcMoments(sig, ret []float64) Moments {
-	n := len(sig)
-	if n < 2 {
-		return Moments{}
-	}
-
+func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 	var m Moments
-	m.Count = float64(n)
+	first := true
+	prevSig := 0.0
 
-	// Local registers for hot loop
-	var (
-		sSum, rSum, sSq, rSq, prodSum float64
-		pnlSum, pnlSq                 float64
-		hits, valid                   float64
-		turnover, prevSig             float64
-	)
+	for s, r := range seq {
+		m.Count++
 
-	prevSig = sig[0] // approximation
+		m.SumSig += s
+		m.SumRet += r
+		m.SumSqSig += s * s
+		m.SumSqRet += r * r
+		m.SumProd += s * r
 
-	for i := 0; i < n; i++ {
-		s := sig[i]
-		r := ret[i]
-
-		// Pearson components
-		sSum += s
-		rSum += r
-		sSq += s * s
-		rSq += r * r
-		prodSum += s * r
-
-		// PnL components
 		pnl := s * r
-		pnlSum += pnl
-		pnlSq += pnl * pnl
+		m.SumPnL += pnl
+		m.SumSqPnL += pnl * pnl
 
-		// Hit Rate
 		if s != 0 && r != 0 {
-			valid++
+			m.ValidHits++
 			if (s > 0 && r > 0) || (s < 0 && r < 0) {
-				hits++
+				m.Hits++
 			}
 		}
 
-		// Turnover
-		if i > 0 {
+		if !first {
 			d := s - prevSig
 			if d < 0 {
 				d = -d
 			}
-			turnover += d
+			m.Turnover += d
+
+			// Lag-1 accumulators
+			m.SumProdLag += s * prevSig
+			m.SumSqSigLag += prevSig * prevSig
+		} else {
+			first = false
 		}
 		prevSig = s
 	}
 
-	m.SumSig = sSum
-	m.SumRet = rSum
-	m.SumSqSig = sSq
-	m.SumSqRet = rSq
-	m.SumProd = prodSum
-	m.SumPnL = pnlSum
-	m.SumSqPnL = pnlSq
-	m.Hits = hits
-	m.ValidHits = valid
-	m.Turnover = turnover
-
 	return m
 }
 
-// FinalizeMetrics computes the ratios from aggregated moments.
-func FinalizeMetrics(m Moments) MetricStats {
+func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 	if m.Count <= 1 {
-		return MetricStats{}
+		return MetricStats{Count: int(m.Count)}
 	}
 
 	ms := MetricStats{Count: int(m.Count)}
 
-	// 1. Global Pearson IC
+	// 1. Pearson IC
+	// Cov(X,Y) / (StdX * StdY)
 	num := m.Count*m.SumProd - m.SumSig*m.SumRet
 	denX := m.Count*m.SumSqSig - m.SumSig*m.SumSig
 	denY := m.Count*m.SumSqRet - m.SumRet*m.SumRet
@@ -129,14 +108,11 @@ func FinalizeMetrics(m Moments) MetricStats {
 		ms.ICPearson = num / math.Sqrt(denX*denY)
 	}
 
-	// 2. Per-Trade Sharpe
+	// 2. Sharpe
 	meanPnL := m.SumPnL / m.Count
 	varPnL := (m.SumSqPnL / m.Count) - (meanPnL * meanPnL)
-
 	if varPnL > 0 {
 		ms.Sharpe = meanPnL / math.Sqrt(varPnL)
-		// Annualized via t-stat logic
-		ms.SharpeAnnual = ms.Sharpe * math.Sqrt(m.Count)
 	}
 
 	// 3. Hit Rate
@@ -149,5 +125,122 @@ func FinalizeMetrics(m Moments) MetricStats {
 		ms.BreakevenBps = (m.SumPnL / m.Turnover) * 10000.0
 	}
 
+	// 5. Autocorrelation (Corrected for non-zero mean)
+	// Cov(S_t, S_{t-1}) / Var(S_t)
+	// We assume Mean(S_t) ≈ Mean(S_{t-1}) for large N
+	meanSig := m.SumSig / m.Count
+	covLag := (m.SumProdLag / m.Count) - (meanSig * meanSig)
+	varSig := (m.SumSqSig / m.Count) - (meanSig * meanSig)
+
+	if varSig > 1e-15 {
+		ms.AutoCorr = covLag / varSig
+	}
+
+	// 6. IC Stability (t-stat)
+	if len(dailyICs) > 1 {
+		var sum, sumSq float64
+		for _, v := range dailyICs {
+			sum += v
+			sumSq += v * v
+		}
+		mean := sum / float64(len(dailyICs))
+		variance := (sumSq / float64(len(dailyICs))) - (mean * mean)
+		if variance > 0 {
+			stdDev := math.Sqrt(variance)
+			// t = mean / SE = mean / (std / sqrt(N))
+			ms.IC_TStat = mean / (stdDev / math.Sqrt(float64(len(dailyICs))))
+		}
+	}
+
 	return ms
+}
+
+// --- Quantile Math ---
+
+type BucketResult struct {
+	ID        int
+	AvgSig    float64
+	AvgRetBps float64
+	Count     int
+}
+
+// ComputeQuantiles sorts (sig, ret) pairs and averages them into buckets.
+// Used for linearity/monotonicity checks.
+func ComputeQuantiles(sigs, rets []float64, numBuckets int) []BucketResult {
+	n := len(sigs)
+	if n == 0 || numBuckets <= 0 {
+		return nil
+	}
+
+	type pair struct {
+		s, r float64
+	}
+	pairs := make([]pair, n)
+	for i := 0; i < n; i++ {
+		pairs[i] = pair{s: sigs[i], r: rets[i]}
+	}
+
+	// Sort by Signal Strength
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].s < pairs[j].s
+	})
+
+	results := make([]BucketResult, numBuckets)
+	bucketSize := n / numBuckets
+	if bucketSize == 0 {
+		bucketSize = 1
+	}
+
+	for b := 0; b < numBuckets; b++ {
+		start := b * bucketSize
+		end := start + bucketSize
+		if b == numBuckets-1 || end > n {
+			end = n
+		}
+		if start >= n {
+			break
+		}
+
+		var sumS, sumR float64
+		count := 0
+		for i := start; i < end; i++ {
+			sumS += pairs[i].s
+			sumR += pairs[i].r
+			count++
+		}
+		if count > 0 {
+			results[b] = BucketResult{
+				ID:        b + 1,
+				AvgSig:    sumS / float64(count),
+				AvgRetBps: (sumR / float64(count)) * 10000.0,
+				Count:     count,
+			}
+		}
+	}
+	return results
+}
+
+// Aggregates bucket results across days
+type BucketAgg struct {
+	Count     int
+	SumSig    float64
+	SumRetBps float64
+}
+
+func (ba *BucketAgg) Add(br BucketResult) {
+	ba.Count += br.Count
+	ba.SumSig += br.AvgSig * float64(br.Count)
+	ba.SumRetBps += br.AvgRetBps * float64(br.Count)
+}
+
+func (ba BucketAgg) Finalize(id int) BucketResult {
+	if ba.Count == 0 {
+		return BucketResult{ID: id}
+	}
+	return BucketResult{
+		ID:        id,
+		AvgSig:    ba.SumSig / float64(ba.Count),
+		AvgRetBps: ba.SumRetBps / float64(ba.Count),
+		Count:     ba.Count,
+	}
 }

@@ -91,18 +91,6 @@ Available commands:
 ./quant.exe sanity
 ```
 
-## Output Examples of `study` Output
-
-```
-== Horizon 60 seconds ==
-VARIANT                 IS_DAYS OOS_DAYS IS_IC   OOS_IC  IS_SR  OOS_SR  IS_HIT   OOS_HIT  IS_BE  OOS_BE
--------                 ------- -------- -----   ------  -----  ------  ------- 1%      1%      -----  ------
-A_Hawkes_Core           1459    698      0.0187  0.0214  4.82   5.31    53.2%   54.1%    9.1    10.4
-B_Hawkes_Adaptive       1459    698      0.0201  0.0238  5.41   6.12    53.8%   55.0%   10.8    12.3
-C_MultiEMA_PowerLaw     1459    698      0.0165  0.0182  4.21   4.68    52.9%   53.4%    8.2     9.1
-D_EMA_Baseline          1459    698      0.0098  0.0071  2.65   2.11    51.8%   51.3%    4.9     3.8
-```
-
 ## Customization
 
 All model parameters are defined in `ofibuild.go` inside `BuildVariants`. You may:
@@ -124,3 +112,139 @@ All model parameters are defined in `ofibuild.go` inside `BuildVariants`. You ma
 This code is provided as-is for research and educational purposes. No warranty is offered. Feel free to modify and extend.
 
 Author: Dylan Siegel QuantDev.ai – 2025
+
+ALL CODE is TUNED for this spec-
+
+### **System Specs Confirmed:**
+
+  * **OS:** Windows 11 (build implicitly optimized for 23H2/24H2 schedulers)
+  * **Runtime:** Go 1.25.4 (pure stdlib)
+  * **CPU:** AMD Ryzen 9 7900X (Zen 4, 12C/24T, AVX-512, BMI2)
+  * **Target:** `windows/amd64`
+
+As a Go 1.25+ expert, I have compiled the definitive list of "new" features and configurations you must use to saturate the Ryzen 9 7900X's throughput. We are moving beyond legacy Go idioms.
+
+-----
+
+### **1. The Critical Compiler Flag: `GOAMD64=v4`**
+
+For the Ryzen 7000 series (Zen 4), you must stop using the default (`v1`) or even the common optimization (`v3`).
+
+  * **Setting:** `set GOAMD64=v4`
+  * **Why:** Zen 4 is the first Ryzen architecture to fully support the **AVX-512** instruction set. `v4` enables the Go compiler to emit AVX-512 instructions (including `EVEX` prefixes) directly in the standard library for math, hashing, and memory operations.
+  * **Performance Impact:**
+      * **Vectorization:** Massive speedups in `bytes.Index`, `strings.Count`, and `math` operations using 512-bit registers (ZMM) where applicable, or optimized 256-bit AVX-512-VL instructions.
+      * **Throughput:** Reduces instruction count for heavy data processing loops by utilizing the Ryzen 7900X's wide execution units.
+
+### **2. `encoding/json/v2` (The New Standard)**
+
+Go 1.25 finalized the `encoding/json/v2` API (often gated behind `GOEXPERIMENT=jsonv2` in earlier RCs, but stable in 1.25.4 context).
+
+  * **The Change:** Drop `encoding/json`. Use the v2 semantics for zero-allocation streaming.
+  * **Hardware optimization:** Heavily optimized using BMI2 instructions (`PDEP`/`PEXT`) which are native and incredibly fast on Zen 4, unlike previous Zen architectures.
+  * **Code Pattern:**
+    ```go
+    // Direct zero-alloc streaming leveraging Ryzen IO throughput
+    import "encoding/json/v2"
+
+    func StreamProcessing(r io.Reader) error {
+        dec := json.NewDecoder(r)
+        for {
+            // "dec.Decode" in v2 uses SIMD-accelerated whitespace skipping
+            tok, err := dec.ReadToken()
+            if err == io.EOF { break }
+            if err != nil { return err }
+            // process tok...
+        }
+        return nil
+    }
+    ```
+
+### **3. `unique` Package (Interning)**
+
+Introduced in Go 1.23 and polished in 1.25, `unique` provides safe, deduplicated "handles" for comparable values.
+
+  * **Target Use:** High-cardinality string data (e.g., parsing logs, processing JSON keys).
+  * **Why:** Reduces GC pressure significantly. On a 32GB RAM system, this prevents memory fragmentation and keeps the Ryzen's L3 cache (64MB) hot with actual data, not duplicate string headers.
+  * **Code Pattern:**
+    ```go
+    import "unique"
+
+    type UserID = unique.Handle[string]
+
+    func DedupID(raw string) UserID {
+        // Returns a canonical handle. Pointer comparison is now O(1).
+        return unique.Make(raw)
+    }
+    ```
+
+### **4. Iterators (`iter`, `slices`, `maps`)**
+
+The `range` over function feature (Go 1.23+) is now the dominant idiom in Go 1.25 for high-performance pipelines.
+
+  * **Optimization:** The compiler in 1.25.4 aggressively inlines iterator closures ("mid-stack inlining"). This eliminates the function call overhead previously associated with callbacks, allowing the Ryzen's branch predictor to prefetch data effectively.
+  * **Code Pattern:**
+    ```go
+    import (
+        "iter"
+        "slices"
+    )
+
+    // Zero-alloc filtering pipeline
+    func FilterFast(seq iter.Seq[int]) iter.Seq[int] {
+        return func(yield func(int) bool) {
+            for v := range seq {
+                // Compiler inlines this logic directly into the caller
+                if v % 2 == 0 {
+                    if !yield(v) { return }
+                }
+            }
+        }
+    }
+    ```
+
+### **5. `weak` Package (Weak Pointers)**
+
+New in Go 1.24/1.25, `weak` allows holding references to memory without preventing garbage collection.
+
+  * **Target Use:** Implementing caches without memory leaks.
+  * **Performance:** Allows aggressive `GOGC` tuning. You can set `GOGC=200` to utilize your 32GB RAM, but use `weak` pointers for caches so the GC can still reclaim space if pressure spikes.
+  * **Code Pattern:**
+    ```go
+    import "weak"
+
+    var cache = make(map[string]weak.Pointer[BigStruct])
+    ```
+
+### **6. Runtime Tuning: `GreenTeaGC`**
+
+Go 1.25 introduced the "GreenTea" generational garbage collector optimization as a toggle.
+
+  * **Configuration:** `set GOEXPERIMENT=greenteagc`
+  * **Why:** It implements a "generational" hypothesis within the concurrent mark-sweep GC. It separates young objects (short-lived) from old ones.
+  * **Ryzen Benefit:** This drastically reduces the number of write barriers and cache misses on the Ryzen 9 7900X, which has high core counts. It prevents the 24 threads from stalling on GC assists during high-throughput allocation phases.
+
+### **7. `sync/atomic` Extended Types**
+
+Stop using `sync.Mutex` for simple counters or boolean flags. Go 1.25 extended `sync/atomic` fully.
+
+  * **New Types:** `atomic.Int64`, `atomic.Bool`, `atomic.Pointer[T]`.
+  * **Why:** These map directly to hardware `LOCK XCHG` or `CMPXCHG` instructions. On Zen 4, these are executed with extremely low latency compared to the OS-mediated mutex locks.
+
+-----
+
+### **Summary of "New" Stack for Your Setup**
+
+| Feature | Version | Role in Your Stack | Hardware Connection |
+| :--- | :--- | :--- | :--- |
+| **`GOAMD64=v4`** | Build | **MANDATORY**. Enables AVX-512. | Unlocks full Zen 4 instruction set. |
+| **`iter`** | Stdlib | High-throughput data pipelines. | Enables aggressive inlining & prefetching. |
+| **`unique`** | Stdlib | String deduplication/Interning. | Saves RAM/L3 Cache bandwidth. |
+| **`encoding/json/v2`**| Stdlib | JSON I/O. | Uses BMI2 instructions for parsing. |
+| **`weak`** | Stdlib | Caching/Memory mgmt. | Prevents OOMs with aggressive GOGC. |
+| **`GreenTeaGC`** | Runtime | Garbage Collection. | Optimizes for 12c/24t concurrency. |
+
+Gloabally SET- v4
+
+[System.Environment]::SetEnvironmentVariable("GOAMD64", "v4", [System.EnvironmentVariableTarget]::User)
+[System.Environment]::SetEnvironmentVariable("GOGC", "200", [System.EnvironmentVariableTarget]::User)

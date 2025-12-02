@@ -12,10 +12,15 @@ import (
 	"sync"
 )
 
-// runSanity verifies that all month-level data/index files are structurally sound
-// and that checksums and basic header/length invariants hold.
+// runSanity scans all months for the currently active Symbol() and validates
+// that index.quantdev and data.quantdev are consistent, including:
+//   - presence of both files
+//   - index header magic and row count
+//   - compressed blobs readable and checksummed
+//   - AGG3 header present and valid
+//   - AGG3 body length matches HeaderSize + rowCount*RowSize
 func runSanity() {
-	root := filepath.Join(BaseDir, Symbol)
+	root := filepath.Join(BaseDir, Symbol())
 	dirs, err := os.ReadDir(root)
 	if err != nil {
 		fmt.Printf("SANITY: cannot read root %s: %v\n", root, err)
@@ -33,13 +38,17 @@ func runSanity() {
 			continue
 		}
 		for _, m := range months {
-			if m.IsDir() {
-				tasks = append(tasks, filepath.Join(root, y.Name(), m.Name()))
+			if !m.IsDir() {
+				continue
 			}
+			tasks = append(tasks, filepath.Join(root, y.Name(), m.Name()))
 		}
 	}
 
-	fmt.Printf("SANITY CHECK: %s (%d months)\n", Symbol, len(tasks))
+	fmt.Printf("SANITY CHECK: %s (%d months)\n", Symbol(), len(tasks))
+	if len(tasks) == 0 {
+		return
+	}
 
 	var wg sync.WaitGroup
 	jobs := make(chan string, len(tasks))
@@ -79,28 +88,25 @@ func validateMonth(dir string) {
 	}
 	defer fData.Close()
 
-	hdr := make([]byte, 16)
-	if _, err := io.ReadFull(fIdx, hdr); err != nil {
-		fmt.Printf("FAIL: %s (Index header read error: %v)\n", dir, err)
+	var hdr [16]byte
+	if _, err := io.ReadFull(fIdx, hdr[:]); err != nil {
+		fmt.Printf("FAIL: %s (Header Read Error: %v)\n", dir, err)
 		return
 	}
-
 	if string(hdr[:4]) != IdxMagic {
-		fmt.Printf("FAIL: %s (Bad index magic)\n", dir)
+		fmt.Printf("FAIL: %s (Bad Index Magic)\n", dir)
 		return
 	}
 
 	count := binary.LittleEndian.Uint64(hdr[8:])
-	row := make([]byte, 26)
-	issues := 0
+	var row [26]byte
 
+	issues := 0
 	for i := uint64(0); i < count; i++ {
-		if _, err := io.ReadFull(fIdx, row); err != nil {
-			fmt.Printf("FAIL: %s (Index row read error at %d: %v)\n", dir, i, err)
+		if _, err := io.ReadFull(fIdx, row[:]); err != nil {
 			issues++
 			break
 		}
-
 		offset := int64(binary.LittleEndian.Uint64(row[2:]))
 		length := int(binary.LittleEndian.Uint64(row[10:]))
 		expSum := binary.LittleEndian.Uint64(row[18:])
@@ -110,12 +116,12 @@ func validateMonth(dir string) {
 			continue
 		}
 
-		// Read compressed blob
-		compData := make([]byte, length)
 		if _, err := fData.Seek(offset, io.SeekStart); err != nil {
 			issues++
 			continue
 		}
+
+		compData := make([]byte, length)
 		if _, err := io.ReadFull(fData, compData); err != nil {
 			issues++
 			continue
@@ -133,28 +139,27 @@ func validateMonth(dir string) {
 			continue
 		}
 
-		// Check checksum
+		// Check checksum of full AGG3 blob.
 		s := sha256.Sum256(aggBlob)
 		if binary.LittleEndian.Uint64(s[:8]) != expSum {
 			issues++
 			continue
 		}
 
-		// Basic structural checks
+		// Validate AGG3 header.
 		if len(aggBlob) < HeaderSize {
 			issues++
 			continue
 		}
-
-		// Validate header magic
 		if string(aggBlob[:4]) != AggMagic {
 			issues++
 			continue
 		}
 
-		rowCount := binary.LittleEndian.Uint64(aggBlob[8:])
-		expectedLen := HeaderSize + int(rowCount)*RowSize
-		if expectedLen != len(aggBlob) {
+		// Optional but stronger check: rowCount vs length.
+		rowCount := binary.LittleEndian.Uint64(aggBlob[8:16])
+		expectedSize := HeaderSize + int(rowCount)*RowSize
+		if expectedSize != len(aggBlob) {
 			issues++
 			continue
 		}

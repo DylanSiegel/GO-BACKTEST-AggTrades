@@ -15,31 +15,24 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 )
 
-// --- Local Constants (Specific to Data Downloader) ---
 const (
-	// Data Source
 	HostData   = "data.binance.vision"
 	S3Prefix   = "data/futures/um"
 	DataSet    = "aggTrades"
 	FallbackDt = "2020-01-01"
 )
 
-// --- Globals ---
 var (
 	httpClient *http.Client
-	stopEvent  bool
-	stopMu     sync.Mutex
-
-	// Directory Locks to fix race conditions on monthly files
-	dirLocks sync.Map
+	stopEvent  atomic.Bool
+	dirLocks   sync.Map
 )
 
 func init() {
-	// High-throughput Transport (no TLS hacks)
 	tr := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
@@ -51,20 +44,17 @@ func init() {
 	}
 }
 
-// runData is called by main()
 func runData() {
-	// Graceful Shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// On Windows, os.Interrupt is the relevant signal.
+	signal.Notify(sigChan, os.Interrupt)
 	go func() {
 		<-sigChan
-		stopMu.Lock()
-		stopEvent = true
-		stopMu.Unlock()
+		stopEvent.Store(true)
 		fmt.Println("\n[warn] Stopping gracefully (finish current jobs)...")
 	}()
 
-	fmt.Printf("--- data.go (Ryzen 7900X Optimized) | Symbol: %s ---\n", Symbol)
+	fmt.Printf("--- data.go (Ryzen 7900X Safe-Mode) | Symbol: %s ---\n", Symbol())
 
 	start, err := time.Parse("2006-01-02", FallbackDt)
 	if err != nil {
@@ -78,7 +68,6 @@ func runData() {
 		return
 	}
 
-	// Generate Job Queue
 	var days []time.Time
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
 		days = append(days, d)
@@ -90,20 +79,14 @@ func runData() {
 	results := make(chan string, len(days))
 	var wg sync.WaitGroup
 
-	// Workers
 	for i := 0; i < CPUThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for d := range jobs {
-				// Check Stop Signal
-				stopMu.Lock()
-				if stopEvent {
-					stopMu.Unlock()
+				if stopEvent.Load() {
 					return
 				}
-				stopMu.Unlock()
-
 				results <- processDay(d)
 			}
 		}()
@@ -116,7 +99,6 @@ func runData() {
 	wg.Wait()
 	close(results)
 
-	// Stats
 	stats := make(map[string]int)
 	for r := range results {
 		key := strings.SplitN(r, " ", 2)[0]
@@ -128,16 +110,13 @@ func runData() {
 func processDay(d time.Time) string {
 	y, m, day := d.Year(), int(d.Month()), d.Day()
 
-	// Paths
-	dirPath := filepath.Join(BaseDir, Symbol, fmt.Sprintf("%04d", y), fmt.Sprintf("%02d", m))
+	dirPath := filepath.Join(BaseDir, Symbol(), fmt.Sprintf("%04d", y), fmt.Sprintf("%02d", m))
 	idxPath := filepath.Join(dirPath, "index.quantdev")
 	dataPath := filepath.Join(dirPath, "data.quantdev")
 
-	// 1. Get Directory Lock (serialize Index/Data per month)
 	muAny, _ := dirLocks.LoadOrStore(dirPath, &sync.Mutex{})
 	mu := muAny.(*sync.Mutex)
 
-	// 2. Check Index (Fast Read)
 	mu.Lock()
 	indexed := isIndexed(idxPath, day)
 	mu.Unlock()
@@ -146,9 +125,9 @@ func processDay(d time.Time) string {
 		return "skip"
 	}
 
-	// 3. Download (Concurrent / Slow IO)
+	sym := Symbol()
 	url := fmt.Sprintf("https://%s/%s/daily/%s/%s/%s-%s-%04d-%02d-%02d.zip",
-		HostData, S3Prefix, DataSet, Symbol, Symbol, DataSet, y, m, day)
+		HostData, S3Prefix, DataSet, sym, sym, DataSet, y, m, day)
 
 	zipBytes, err := download(url)
 	if err != nil {
@@ -158,7 +137,6 @@ func processDay(d time.Time) string {
 		return "error_dl"
 	}
 
-	// 4. Fast Parse (Concurrent / High CPU)
 	aggBlob, count, err := fastZipToAgg3(d, zipBytes)
 	if err != nil {
 		return "error_parse"
@@ -167,10 +145,8 @@ func processDay(d time.Time) string {
 		return "empty"
 	}
 
-	// 5. Compress (Concurrent / High CPU)
 	var b bytes.Buffer
-	const zLevel = zlib.BestSpeed
-	w, err := zlib.NewWriterLevel(&b, zLevel)
+	w, err := zlib.NewWriterLevel(&b, zlib.BestSpeed)
 	if err != nil {
 		return "error_zlib"
 	}
@@ -183,25 +159,21 @@ func processDay(d time.Time) string {
 	}
 	compBlob := b.Bytes()
 
-	// 6. Checksum (Concurrent)
 	sum := sha256.Sum256(aggBlob)
 	cSum := binary.LittleEndian.Uint64(sum[:8])
 
-	// 7. Write Data & Update Index (Serialized / Fast IO)
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Double check index in case another thread finished this day while we were processing
 	if isIndexed(idxPath, day) {
 		return "skip_race"
 	}
 
-	if err := os.MkdirAll(dirPath, 0755); err != nil {
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
 		return "error_mkdir"
 	}
 
-	// Append Data
-	fData, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	fData, err := os.OpenFile(dataPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return "error_io"
 	}
@@ -216,12 +188,9 @@ func processDay(d time.Time) string {
 		fData.Close()
 		return "error_write"
 	}
-	if err := fData.Close(); err != nil {
-		return "error_close_data"
-	}
+	fData.Close()
 
-	// Append / Init Index
-	fIdx, err := os.OpenFile(idxPath, os.O_CREATE|os.O_RDWR, 0644)
+	fIdx, err := os.OpenFile(idxPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return "error_idx"
 	}
@@ -232,18 +201,16 @@ func processDay(d time.Time) string {
 		return "error_idx_stat"
 	}
 	if idxStat.Size() == 0 {
-		// Init Index Header
-		hdr := make([]byte, 16)
+		var hdr [16]byte
 		copy(hdr[0:], IdxMagic)
 		binary.LittleEndian.PutUint32(hdr[4:], uint32(IdxVersion))
-		binary.LittleEndian.PutUint64(hdr[8:], 0) // Count = 0
-		if _, err := fIdx.Write(hdr); err != nil {
+		binary.LittleEndian.PutUint64(hdr[8:], 0)
+		if _, err := fIdx.Write(hdr[:]); err != nil {
 			return "error_idx_hdr"
 		}
 	}
 
-	// Index Row: Day(2), Offset(8), Length(8), Checksum(8) = 26 bytes
-	row := make([]byte, 26)
+	var row [26]byte
 	binary.LittleEndian.PutUint16(row[0:], uint16(day))
 	binary.LittleEndian.PutUint64(row[2:], uint64(offset))
 	binary.LittleEndian.PutUint64(row[10:], uint64(len(compBlob)))
@@ -252,11 +219,10 @@ func processDay(d time.Time) string {
 	if _, err := fIdx.Seek(0, io.SeekEnd); err != nil {
 		return "error_idx_seek"
 	}
-	if _, err := fIdx.Write(row); err != nil {
+	if _, err := fIdx.Write(row[:]); err != nil {
 		return "error_idx_write"
 	}
 
-	// Increment Index Count (Atomic update under lock)
 	if _, err := fIdx.Seek(8, io.SeekStart); err != nil {
 		return "error_idx_seek"
 	}
@@ -279,7 +245,6 @@ func processDay(d time.Time) string {
 var errNotFound = fmt.Errorf("404")
 
 func download(url string) ([]byte, error) {
-	// Retry logic optimized for throughput
 	for i := 0; i < 3; i++ {
 		resp, err := httpClient.Get(url)
 		if err == nil {
@@ -308,9 +273,8 @@ func isIndexed(idxPath string, day int) bool {
 	}
 	defer f.Close()
 
-	// Read Header
-	hdr := make([]byte, 16)
-	if _, err := io.ReadFull(f, hdr); err != nil {
+	var hdr [16]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
 		return false
 	}
 	if string(hdr[:4]) != IdxMagic {
@@ -318,10 +282,9 @@ func isIndexed(idxPath string, day int) bool {
 	}
 	count := binary.LittleEndian.Uint64(hdr[8:])
 
-	// Scan Rows (max 31)
-	row := make([]byte, 26)
+	var row [26]byte
 	for i := uint64(0); i < count; i++ {
-		if _, err := io.ReadFull(f, row); err != nil {
+		if _, err := io.ReadFull(f, row[:]); err != nil {
 			break
 		}
 		if int(binary.LittleEndian.Uint16(row[0:])) == day {
@@ -331,14 +294,48 @@ func isIndexed(idxPath string, day int) bool {
 	return false
 }
 
-// fastZipToAgg3: Zero-alloc column scanning + Binary Packing
+// parseBuyerMakerFlag interprets the is_buyer_maker CSV column.
+// Expect values like "true"/"false" (case-insensitive).
+// Returns bit 0 = 1 if is_buyer_maker == true.
+func parseBuyerMakerFlag(col []byte) uint16 {
+	if len(col) == 0 {
+		return 0
+	}
+	switch col[0] {
+	case 't', 'T': // "true"
+		return 1
+	default:
+		return 0
+	}
+}
+
+// --- CSV Parser ---
+//
+// CSV Layout (7 columns):
+//
+//	0: agg_trade_id      (uint64)
+//	1: price             (float, fixed-point 1e-8)
+//	2: quantity          (float, fixed-point 1e-8)
+//	3: first_trade_id    (uint64)
+//	4: last_trade_id     (uint64)
+//	5: transact_time     (uint64, ms)
+//	6: is_buyer_maker    ("true"/"false")
+//
+// Row layout (RowSize = 48):
+//
+//	0..7   : agg_trade_id (uint64)          [optional, not used downstream]
+//	8..15  : price_fixed (uint64)
+//	16..23 : qty_fixed   (uint64)
+//	24..31 : first_trade_id (uint64)
+//	32..35 : trade_count = last - first + 1 (uint32)
+//	36..37 : flags (uint16), bit 0 = is_buyer_maker
+//	38..45 : transact_time (uint64)
+//	46..47 : unused / padding
 func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 	r, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		return nil, 0, err
 	}
-
-	const zLevel = zlib.BestSpeed // informational only, used in header
 
 	for _, f := range r.File {
 		if !strings.HasSuffix(f.Name, ".csv") {
@@ -349,35 +346,30 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			continue
 		}
 
-		// 32GB RAM allows reading full CSV.
 		data, err := io.ReadAll(rc)
 		rc.Close()
 		if err != nil {
 			return nil, 0, err
 		}
 
-		// Estimation: ~70 bytes CSV -> 48 bytes Bin
 		estRows := len(data) / 50
 		if estRows < 1 {
 			estRows = 1
 		}
 		blob := make([]byte, 0, estRows*RowSize)
-		rowBuf := make([]byte, RowSize)
+		var rowBuf [RowSize]byte
 
 		var (
-			minTs int64 = math.MaxInt64
-			maxTs int64 = math.MinInt64
-			count uint64
-
-			// Column Tracking
-			// 0:id, 1:px, 2:qty, 3:fid, 4:lid, 5:ts, 6:m
+			minTs  int64 = math.MaxInt64
+			maxTs  int64 = math.MinInt64
+			count  uint64
 			colIdx int
 			start  int
 			i      int
 			n      = len(data)
 		)
 
-		// Skip Header Line
+		// Skip header line
 		for i < n {
 			if data[i] == '\n' {
 				i++
@@ -387,74 +379,69 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			i++
 		}
 
-		// State Machine Loop
 		for i < n {
 			b := data[i]
-
 			switch b {
 			case ',':
 				colSlice := data[start:i]
-
 				switch colIdx {
-				case 0: // AggID
+				case 0:
+					// agg_trade_id (stored but not used downstream)
 					binary.LittleEndian.PutUint64(rowBuf[0:], fastParseUint(colSlice))
-				case 1: // Price
+				case 1:
+					// price
 					binary.LittleEndian.PutUint64(rowBuf[8:], fastParseFloatFixed(colSlice))
-				case 2: // Qty
+				case 2:
+					// quantity
 					binary.LittleEndian.PutUint64(rowBuf[16:], fastParseFloatFixed(colSlice))
-				case 3: // FirstID
+				case 3:
+					// first_trade_id
 					binary.LittleEndian.PutUint64(rowBuf[24:], fastParseUint(colSlice))
-				case 4: // LastID -> Count
+				case 4:
+					// last_trade_id -> trade count
 					fid := binary.LittleEndian.Uint64(rowBuf[24:])
 					lid := fastParseUint(colSlice)
-					binary.LittleEndian.PutUint32(rowBuf[32:], uint32(lid-fid+1))
-				case 5: // Time
+					if lid >= fid {
+						binary.LittleEndian.PutUint32(rowBuf[32:], uint32(lid-fid+1))
+					} else {
+						binary.LittleEndian.PutUint32(rowBuf[32:], 0)
+					}
+				case 5:
+					// transact_time
 					ts := fastParseUint(colSlice)
 					binary.LittleEndian.PutUint64(rowBuf[38:], ts)
-					if int64(ts) < minTs {
-						minTs = int64(ts)
+					ts64 := int64(ts)
+					if ts64 < minTs {
+						minTs = ts64
 					}
-					if int64(ts) > maxTs {
-						maxTs = int64(ts)
+					if ts64 > maxTs {
+						maxTs = ts64
 					}
 				}
-
 				colIdx++
 				start = i + 1
 
 			case '\n':
-				// End of row (Maker Flag)
+				// Last column: is_buyer_maker
 				colSlice := data[start:i]
-
-				// Case 6: is_buyer_maker
-				flags := uint16(0)
-				if len(colSlice) > 0 {
-					c := colSlice[0]
-					if c == 't' || c == 'T' {
-						flags = 1
-					}
-				}
+				flags := parseBuyerMakerFlag(colSlice)
 				binary.LittleEndian.PutUint16(rowBuf[36:], flags)
 
-				// Append Row
-				blob = append(blob, rowBuf...)
+				blob = append(blob, rowBuf[:]...)
 				count++
-
 				colIdx = 0
 				start = i + 1
 			}
 			i++
 		}
 
-		// Handle case where file doesn't end with \n
+		// Handle final line without trailing newline
 		if colIdx == 6 && start < n {
 			colSlice := data[start:n]
-			flags := uint16(0)
-			if len(colSlice) > 0 && (colSlice[0] == 't' || colSlice[0] == 'T') {
-				flags = 1
-			}
+			flags := parseBuyerMakerFlag(colSlice)
 			binary.LittleEndian.PutUint16(rowBuf[36:], flags)
-			blob = append(blob, rowBuf...)
+
+			blob = append(blob, rowBuf[:]...)
 			count++
 		}
 
@@ -462,23 +449,22 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 			return nil, 0, nil
 		}
 
-		// Header construction (Matches AggHeader: 48 bytes)
-		hdr := make([]byte, HeaderSize)
+		var hdr [HeaderSize]byte
 		copy(hdr[0:], AggMagic)
-		hdr[4] = 1
-		hdr[5] = uint8(t.Day())
-		binary.LittleEndian.PutUint16(hdr[6:], uint16(zLevel)) // zlib level (informational)
+		hdr[4] = 1              // version
+		hdr[5] = uint8(t.Day()) // day-of-month
+		binary.LittleEndian.PutUint16(hdr[6:], uint16(zlib.BestSpeed))
 		binary.LittleEndian.PutUint64(hdr[8:], count)
 		binary.LittleEndian.PutUint64(hdr[16:], uint64(minTs))
 		binary.LittleEndian.PutUint64(hdr[24:], uint64(maxTs))
-		// Bytes 32-47 are padding (zero initialized by make)
 
-		return append(hdr, blob...), count, nil
+		out := make([]byte, 0, HeaderSize+len(blob))
+		out = append(out, hdr[:]...)
+		out = append(out, blob...)
+		return out, count, nil
 	}
 	return nil, 0, fmt.Errorf("no csv")
 }
-
-// --- High Performance Parsers (No Alloc) ---
 
 func fastParseUint(b []byte) uint64 {
 	var n uint64
@@ -488,7 +474,12 @@ func fastParseUint(b []byte) uint64 {
 	return n
 }
 
-// Converts "123.45" -> 12345000000 (scaled 1e8)
+const targetDecimals = 8
+
+var pow10 = [...]uint64{
+	1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
+}
+
 func fastParseFloatFixed(b []byte) uint64 {
 	var n uint64
 	seenDot := false
@@ -505,16 +496,27 @@ func fastParseFloatFixed(b []byte) uint64 {
 		}
 	}
 
-	// Adjust Scale 1e8
-	const target = 8
-	if decimals < target {
-		for i := 0; i < (target - decimals); i++ {
+	if decimals == targetDecimals {
+		return n
+	}
+
+	if decimals < targetDecimals {
+		diff := targetDecimals - decimals
+		if diff < len(pow10) {
+			return n * pow10[diff]
+		}
+		for i := 0; i < diff; i++ {
 			n *= 10
 		}
-	} else if decimals > target {
-		for i := 0; i < (decimals - target); i++ {
-			n /= 10
-		}
+		return n
+	}
+
+	diff := decimals - targetDecimals
+	if diff < len(pow10) {
+		return n / pow10[diff]
+	}
+	for i := 0; i < diff; i++ {
+		n /= 10
 	}
 	return n
 }
