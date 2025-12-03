@@ -4,11 +4,18 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"time"
 )
 
 func main() {
+	// Use all 7900X hardware threads.
 	runtime.GOMAXPROCS(CPUThreads)
+
+	// Hard memory limit: ~30GB heap.
+	// This is a guardrail on top of GOGC=200, not a replacement.
+	const ramLimit = 30 * 1024 * 1024 * 1024
+	debug.SetMemoryLimit(ramLimit)
 
 	if len(os.Args) < 2 {
 		printHelp()
@@ -17,7 +24,7 @@ func main() {
 
 	start := time.Now()
 
-	fmt.Printf("Go 1.25.4 | Env: %s/%s | Threads: %d | GOGC: %s | AMD64: %s\n",
+	fmt.Printf("Go 1.25.4 | Env: %s/%s | Threads: %d | RAM Limit: 30GB | GOGC: %s | AMD64: %s\n",
 		runtime.GOOS, runtime.GOARCH,
 		runtime.GOMAXPROCS(0),
 		os.Getenv("GOGC"),

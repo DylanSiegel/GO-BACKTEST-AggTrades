@@ -1,3 +1,754 @@
+This is a big step up from the first version. You’ve fixed most of the brittle gating and quantile issues and made the structure a lot more coherent (pun intended). I’ll treat these as “v2” and be strict about what’s still not 10/10 and what I’d adjust before calling them “locked.”
+
+I’ll do:
+
+1. Cross-cutting comments on the shared state and weighting scheme.
+2. Kernel-by-kernel critique with concrete small tweaks.
+3. A short “final form” checklist so you can implement without ambiguity.
+
+---
+
+## 1. Cross-cutting comments
+
+### 1.1 You still have one true primitive (Zf) with 4 variations
+
+You’ve improved the *roles*, but in terms of actual information content:
+
+* K1: Zf with coherence/vol/activity weights.
+* K2: saturated function of |Zf| (tails).
+* K3: Zf modulated by Zs (alignment).
+* K4: Zf modulated by r_fast_z and regime weights.
+* K5: −Zf modulated by z_elast, Zs, coherence.
+
+So structurally you still have:
+
+> 1 fast-flow primitive (Zf),
+> 1 slower-flow primitive (Zs),
+> 1 price-impulse primitive (r_fast_z),
+> 1 elasticity primitive (z_elast),
+> and 5 kernels that are different nonlinear *mixtures* of those.
+
+That’s acceptable, but for combination / regularization you should treat them as *correlated features*, not independent alpha lines. “10/10” here means: you understand that they’re different *views* of the same base signals and will regularize accordingly.
+
+### 1.2 Weight library is good, but unify and parameterize
+
+You now have:
+
+* `w_coh = C^γ1`,
+* `w_vol_mid = 1 / (1 + (z_vol / v_mid)^2)`,
+* `w_vol_hi = 1 - 1 / (1 + (z_vol / v_hi)^2)`,
+* `w_act_trend = 0.5 + 0.5 tanh(α_a z_act)`,
+* `w_act_tail = 0.5 + 0.5 tanh(α_t z_act)`.
+
+All sensible. Two issues:
+
+1. **Distribution of C:** if C spends most of its time in [0.5, 0.8], then raising it to γ1=2 will compress the dynamic range. You may want to *normalize C first*, for example:
+
+   ```text
+   C̃ = (C - μ_C) / (σ_C + ε)
+   w_coh = 0.5 + 0.5 * tanh(α_c * C̃)
+   ```
+
+   That preserves “smooth in (0,1)” while adapting to symbol-specific coherence distributions. Using a raw power on [0,1] assumes the distribution is nicely spread.
+
+2. **Symmetry vs asymmetry in vol:**
+   `w_vol_mid` is symmetric in z_vol. You are punishing both very low and very high vol the same way. If you actually like low vol for some layers (e.g., K1) and dislike extreme spikes, you might want:
+
+   ```text
+   w_vol_mid = 1 / (1 + ((max(|z_vol| - z0, 0)) / v_mid)^2)
+   ```
+
+   with z0 ~ 0.5–1.0, so you do not penalize moderate deviations.
+
+I’d make the weights a small “library” with shared hyperparameters rather than hand-tuning each kernel separately.
+
+### 1.3 Clipping vs tanh: define a consistent convention
+
+You use both tanh and clip/scale. I’d standardize:
+
+* For “core trend” style signals (K1/K3), **clip** after dividing by s (preserves linearity in the middle).
+* For tail / saturation signals (K2, K5), **tanh** is fine or clip with small s.
+
+But don’t mix “clip” in some kernels and “tanh” in others unless there is a very specific reason. That makes combined interpretation harder.
+
+---
+
+## 2. Kernel-by-kernel critique and tweaks
+
+### 2.1 K1 – Coherence-weighted Fast OFI Trend
+
+Current:
+
+```text
+g1   = Zf
+w1   = w_coh * w_act_trend * w_vol_mid
+K1   = clip(w1 * g1 / s1, -1, +1)
+```
+
+What’s good:
+
+* Smooth weights everywhere; no hard cuts.
+* Clear role: base micro alpha.
+
+Main issues / tweaks:
+
+1. **Redundant vol + activity suppression in very busy, high-vol times.**
+   `w_act_trend` increases with activity, but `w_vol_mid` declines in high vol. In practice, high vol typically coincides with high activity, so you may partially cancel out. That could be fine, but be explicit: do you actually want to *de-lever* in high-vol bursts? If yes, good. If no, widen v_mid or introduce the z0 shift as mentioned.
+
+2. **Avoid over-penalizing low activity for K1.**
+   K1 is your base layer; you do not necessarily want it to vanish in quiet-but-clean tapes. I’d bias `w_act_trend` to be closer to 0.6–0.8 even at slightly negative z_act (i.e., choose α_a small). Or simpler:
+
+   ```text
+   w_act_trend = 0.3 + 0.7 * (0.5 + 0.5 * tanh(α_a * z_act))
+   ```
+
+   So the weight never drops below 0.3.
+
+If you enact those, K1 is basically “final.”
+
+---
+
+### 2.2 K2 – Tail OFI Burst
+
+Current:
+
+```text
+z0       = 1.5
+z1       = 3.0
+excess   = max(|Zf| - z0, 0)
+tail_frac = clip(excess / (z1 - z0), 0, 1)
+g2       = sign(Zf) * tail_frac
+w2       = w_act_tail * w_coh
+K2       = tanh(β2 * w2 * g2)
+```
+
+What’s good:
+
+* Tail logic is now in Z-space; no fragile quantile denominators.
+* Smooth ramp from “start of tail” to “deep tail.”
+
+Issues / tweaks:
+
+1. **Global z0/z1 may not be right for all symbols.**
+   Using fixed (1.5,3.0) is simpler, but Zf distributions can deviate from N(0,1) after all the microstructure quirks. Consider:
+
+   * Use symbol-specific **EW q80 of |Zf|** as z0 and **EW q98** as z1, but:
+   * Update those quantile estimates *very slowly* (low EW decay) to avoid drift.
+
+   That reintroduces quantiles but with far less brittleness than previous Q_Bf99, and only for *ranges*, not denominators.
+
+2. **K2 and K1 are still very overlapping.**
+   When |Zf| is big and regime is good, K1 is large and K2 is also large. This is conceptually okay if you treat K2 as “tail leverage;” but don’t treat K2 as an independent alpha in model selection. They are nested signals.
+
+3. **Consider using sign(r_fast_z) for confirmation.**
+   A small extra robustness tweak:
+
+   ```text
+   sameDirPrice = (Zf * r_fast_z) > 0
+   if !sameDirPrice:
+       g2 *= 0.5    // or 0
+   ```
+
+   That would avoid firing tail bets when price has *not* acknowledged the flow at all.
+
+---
+
+### 2.3 K3 – Multi-Scale Alignment Trend
+
+Current:
+
+```text
+w_slow_mag = tanh(α_s * |Zs|)
+w_slow_dir = sign(Zs*Zf) * w_slow_mag
+alignment  = (1 + w_slow_dir) / 2
+g3         = alignment * Zf
+w3         = w_coh * w_vol_mid
+K3         = clip(w3 * g3 / s3, -1, +1)
+```
+
+What’s good:
+
+* Smooth transition between “aligned,” “neutral,” “opposed.”
+* No hard thresholds on Zs.
+
+Issues / tweaks:
+
+1. **Hard sign in w_slow_dir is a small discontinuity.**
+   `sign(Zs*Zf)` flips abruptly when Zs*Zf crosses 0. A smoother variant:
+
+   ```text
+   corr_like   = tanh(α_align * Zs * Zf)  // ∈ (-1,1)
+   w_slow_dir  = corr_like * w_slow_mag
+   alignment   = (1 + w_slow_dir) / 2
+   ```
+
+   That avoids a jump at Zs*Zf=0; the alignment changes gradually as alignment becomes less/ more consistent.
+
+2. **Strong redundancy with K1 in aligned regimes.**
+   When Zs is small, alignment≈0.5, so K3≈0.5·Zf weighted by w3. In regimes where Zs is strong and aligned, K1 and K3 will both be large and same sign. That’s expected; just be sure in model fitting you’re okay with collinearity.
+
+I’d implement the smoother `corr_like` form and leave the rest.
+
+---
+
+### 2.4 K4 – Price/Flow Breakout Continuation
+
+Current:
+
+```text
+imp_mag = tanh(α_r * |r_fast_z|)
+align_ok = (Zf * r_fast_z) > 0
+
+w_imp = imp_mag * w_vol_hi * w_act_tail * w_coh
+
+g4 = Zf if align_ok else 0
+K4 = clip(w_imp * g4 / s4, -1, +1)
+```
+
+What’s good:
+
+* Explicit use of both price and flow; this is not just a Zf mask anymore.
+* Uses w_vol_hi, so it really is a “higher-vol regime” kernel.
+
+Issues / tweaks:
+
+1. **Use r_fast_z in the primitive, not just in weight.**
+   Currently, r_fast_z only affects `imp_mag` and alignment_ok; the magnitude of g4 is still Zf. It’s more “flow-in-breakout-regimes” than a true “price-flow breakout” kernel.
+
+   A more symmetric definition:
+
+   ```text
+   g4 = sign(Zf) * min(|Zf|, |r_fast_z|)
+   ```
+
+   or
+
+   ```text
+   g4 = Zf * tanh(α_pr * r_fast_z * sign(Zf))
+   ```
+
+   That way, strong price impulse *and* strong Zf both matter; if one is big and the other is modest, g4 doesn’t explode.
+
+2. **Self-impact in backtests.**
+   This kernel by design fires *after large moves*. If your backtest doesn’t model widened spreads and adverse selection, K4 will look better than it actually is. Not a design flaw, but a practical warning: K4 needs stricter cost assumptions.
+
+I’d update g4 to use min(|Zf|, |r_fast_z|) or a tanh product as above.
+
+---
+
+### 2.5 K5 – Overstretch Mean-Reversion
+
+Current:
+
+```text
+z_e    = z_elast
+z_e0   = 1.0
+excess_e = max(z_e - z_e0, 0)
+w_over   = tanh(α_e * excess_e)
+
+w_flat   = 1 - tanh(α_fs * |Zs|)
+w_noise  = 1 - w_coh   // high when coherence low
+
+g5     = -Zf
+K5_raw = w_over * w_flat * w_noise * g5
+K5     = clip(K5_raw / s5, -kmax, +kmax)   // kmax ~ 0.4
+```
+
+What’s good:
+
+* Clear, controlled design: small amplitude, contrarian, limited to choppy / overstretched regimes.
+* Uses entirely different ingredients (z_elast + low coherence + flat slow Zs).
+
+Issues / tweaks:
+
+1. **Stability of z_elast.**
+   Elasticity is inherently noisy and heavy-tailed. Using z_elast is fine, but you should:
+
+   * Clip raw Elast before computing moments: `Elast_clipped = min(Elast, E_max)` where E_max is some multiple of its long-run mean, to avoid single crazy spikes dominating μ_e,σ_e.
+   * Or take log Elasticity: `logElast`; that stabilizes the distribution.
+
+2. **Protect against Zf≈0.**
+   You do not explicitly require “strong flow” here. If |Zf| is tiny, g5≈0 anyway, but you’re effectively making a mean-reversion decision based primarily on price/elasticity and noise/coherence. That may be fine, but if you want to be stricter:
+
+   ```text
+   w_flow = tanh(α_f * |Zf|)
+   K5_raw = w_over * w_flat * w_noise * w_flow * (-Zf)
+   ```
+
+   So that K5 is meaningful only when there is decent Zf signal in the first place.
+
+3. **kmax needs to be small in practice.**
+   Conceptually you set kmax ~0.4. I’d treat this as a hard risk parameter and not tune it by backtest. If K5 looks amazing only when kmax→1.0, that’s a red flag.
+
+---
+
+## 3. “Locked” checklist
+
+If you want to call these “version 1.0, locked,” I would:
+
+1. Normalize coherence to a z-like variable and define w_coh via tanh, not a raw power on C.
+2. Adjust w_vol_mid to not punish mild vol deviations (add |z_vol|−z0).
+3. Make K3’s alignment fully smooth (replace sign(Zs*Zf) with tanh(α_align Zs Zf)).
+4. For K4, let g4 depend on both |Zf| and |r_fast_z| (min or tanh product).
+5. For K5, stabilize z_elast (clip or log), and optionally add a mild w_flow term.
+6. Standardize a simple squash convention: clipped / scaled linear for K1/K3, tanh or tighter clip for K2/K4/K5.
+
+With those adjustments, the five kernels are:
+
+* **K1:** Core fast flow trend with smooth regime weights.
+* **K2:** Tail-intensity overlay on Zf (mostly leverage, but sparse and smooth).
+* **K3:** Multi-scale trend alignment, genuinely using Zs info.
+* **K4:** Price+flow breakout continuation, sensitive to both primitives.
+* **K5:** Carefully capped contra layer in noisy, overstretched regimes.
+
+If you’d like next, I can write these as explicit `func Kx(state *State) float64` skeletons in Go, including a small “Weights” helper struct for w_coh, w_vol_mid, w_vol_hi, w_act_trend, w_act_tail, so you can plug them into your existing engine without spreading hyperparameters everywhere.
+
+
+Short answer: yes, you captured the design extremely closely, and the wiring of K1–K5 is logically consistent with what we discussed. There are only a few edge cases and polish items I would tighten before calling this “done.”
+
+I’ll go section by section and only flag concrete issues / improvements.
+
+---
+
+## 1. Core / engine layer
+
+### 1.1 Info-time core
+
+```go
+u := tr.Side * math.Sqrt(tr.Qty)
+...
+infoNow := prevInfo + math.Abs(u)
+...
+// shrink fast/slow by info distance > Lfast / Lslow
+```
+
+* Info-time implementation is correct and O(1).
+* `accumBf/accumBs` and `countF/countS` are updated consistently when startF/startS move.
+* `EWVarBf` / `EWVarBs` are updated as an EW of `B^2`:
+
+```go
+diff2 := fast.B * fast.B
+...
+c.EWVarBf = (1-c.VarAlphaB)*c.EWVarBf + c.VarAlphaB*diff2
+```
+
+That matches the “approximate variance assuming mean≈0” approach we discussed.
+
+Minor notes:
+
+* You’re using the same `VarAlphaB` for fast and slow; that’s fine for now, but later you may want a **slower alpha** for `EWVarBs` (slow window variance).
+
+### 1.2 Engine wiring
+
+```go
+core := NewCore(...)
+engine := NewEngine(core)
+...
+feats := engine.Update(tr)
+...
+// write feats[0..4]
+```
+
+This looks good. Each goroutine owns its own `Engine`, so no shared state race.
+
+The early-return branch:
+
+```go
+if fSnap.Count == 0 || sSnap.Count == 0 {
+    C := computeCoherence(e.Core, fSnap)
+    return e.KS.Update(e.Core, fSnap, sSnap, C)
+}
+```
+
+* This is safe: with zero counts, B=0, Zf/Zs drop to ~0 and kernels collapse toward 0.
+* Coherence on N<3 returns 0, so coherence stats will slowly learn “low coherence” during warm-up, which is acceptable.
+
+---
+
+## 2. Online stats / state
+
+### 2.1 EWStat
+
+```go
+mNew := (1-a)*mOld + a*x
+diff := x - mNew
+vNew := (1-a)*s.Var + a*diff*diff
+```
+
+* This is a valid EW variance scheme (not the only one, but fine).
+* `ZScore` guards against `std <= 0`. Good.
+
+### 2.2 EWQuantile
+
+```go
+if x <= theta {
+    q.Value = theta - q.Step*(1.0-q.Q)
+} else {
+    q.Value = theta + q.Step*q.Q
+}
+```
+
+This is a very simple Robbins–Monro quantile update (sign-based, constant step). It matches our “RM-style quantile” idea, but keep in mind:
+
+* Step = 0.005 means you need ~1/0.005 ≈ 200 effective updates to move significantly; that’s okay for fast streams, but slow names may adapt sluggishly to regime changes.
+* It **ignores the magnitude** of (x − θ); only direction matters. That’s acceptable here because you use quantiles only for z0/z1, not as denominators.
+
+Given how you use Q80/Q98 for |Zf|, this is fine, but I would treat `AlphaQuantile` as a crucial tuning knob.
+
+---
+
+## 3. KernelState.Update: shared state
+
+This is the heart of it. You are computing all the pieces we agreed on:
+
+### 3.1 Zf, Zs
+
+```go
+ks.Zf = f.B / (math.Sqrt(core.EWVarBf) + eps)
+ks.Zs = s.B / (math.Sqrt(core.EWVarBs) + eps)
+```
+
+Matches spec.
+
+### 3.2 Volatility / r_fast_z
+
+You approximate Sigma via an EW variance of `rFast`, then z-score log(sigma):
+
+```go
+rFast := (f.PriceLast - f.PriceFirst) / (f.PriceFirst + eps)
+...
+ks.EWVarR = (1-a)*ks.EWVarR + a*r2
+sigma := math.Sqrt(ks.EWVarR + eps)
+xVol := math.Log(sigma + eps)
+ks.VolStat.Update(xVol)
+ks.ZVol = ks.VolStat.ZScore(xVol)
+ks.RFastZ = rFast / (sigma + eps)
+```
+
+This is coherent:
+
+* `RFastZ` is “price move in fast-window sigmas,” per our design.
+* `ZVol` is a z-score of log(sigma), used for vol regime weights.
+
+Minor suggestion:
+
+* You reuse `AlphaVol` both for `EWVarR` and for `VolStat`. You might later want a slower `VolStat` (longer-term regime) and a faster EWVarR (short-horizon sigma), but this is fine for v1.
+
+### 3.3 Activity
+
+```go
+actRaw := float64(f.Count)
+xAct := math.Log(actRaw)
+ks.ActStat.Update(xAct)
+ks.ZAct = ks.ActStat.ZScore(xAct)
+```
+
+* You simplified to use trade count instead of 1/dt trade rate. That’s totally fine; monotonic in activity and cheaper to compute.
+
+### 3.4 Coherence normalization
+
+```go
+ks.CoherStat.Update(coherence)
+ks.CZ = ks.CoherStat.ZScore(coherence)
+```
+
+This matches the “normalize C to a z-like variable” idea. Good.
+
+### 3.5 Elasticity
+
+```go
+dP := f.PriceLast - f.PriceFirst
+eMag := math.Abs(dP) / (math.Abs(f.B) + eps)
+xEl := 0.0
+if eMag > 0 {
+    xEl = math.Log(eMag + eps)
+}
+ks.ElastStat.Update(xEl)
+ks.ZElast = ks.ElastStat.ZScore(xEl)
+```
+
+* This is exactly the “log elasticity” stabilization we wanted.
+* Using ZElast for K5 is now much safer than raw ratios.
+
+### 3.6 |Zf| quantiles
+
+```go
+absZf := math.Abs(ks.Zf)
+ks.ZfAbsQ80.Update(absZf)
+ks.ZfAbsQ98.Update(absZf)
+```
+
+Good; those drive tail thresholds for K2.
+
+---
+
+## 4. Weights: coherence, vol, act, noise, flow
+
+This part lines up extremely well with the spec plus my last round of tweaks.
+
+### 4.1 Coherence weight
+
+```go
+wCoherence := softstep(ks.CZ, cfg.AlphaCoherence)
+ks.WCoherence = clamp(wCoherence, 0.05, 0.99)
+```
+
+* `softstep(z, k) = 0.5 + 0.5*tanh(k*z)` → smooth map (−∞,+∞)→(0,1).
+* Clamp to [0.05, 0.99] ensures nothing truly dies or saturates; perfect.
+
+### 4.2 Vol weights
+
+```go
+u := math.Max(math.Abs(ks.ZVol)-cfg.Z0Mid, 0.0)
+ks.WVolMid = 1 / (1 + (u/VMid)^2)
+
+v := math.Max(ks.ZVol-cfg.ZHi0, 0.0)
+ks.WVolHi = 1 - 1/(1+(v/VHi)^2)
+```
+
+* `WVolMid`: symmetric, only starts penalizing after |ZVol|>Z0Mid; this implements “don’t punish mild vol deviations.”
+* `WVolHi`: only turns on in the upper tail (ZVol>ZHi0), as we wanted for breakout regimes.
+
+### 4.3 Activity weights
+
+```go
+baseTrend := softstep(ks.ZAct, cfg.AlphaActTrend)
+ks.WActTrend = clamp(0.3+0.7*baseTrend, 0.3, 1.0)
+ks.WActTail = softstep(ks.ZAct, cfg.AlphaActTail)
+```
+
+* K1 uses `WActTrend >= 0.3` → base trend never disappears in quiet tapes.
+* K2/K4 use `WActTail` which leans more heavily toward high activity.
+
+### 4.4 Noise and flow strength
+
+```go
+ks.WNoise = clamp(1.0-ks.WCoherence, 0.0, 0.95)
+ks.WFlow  = math.Tanh(cfg.AlphaFlow * math.Abs(ks.Zf))
+```
+
+* `WNoise` high when coherence low, capped at 0.95; ideal for K5.
+* `WFlow` ensures the contra kernel is only non-trivial when |Zf| is non-trivial.
+
+All of this is exactly in line with the intended design.
+
+---
+
+## 5. Kernels K1–K5
+
+### 5.1 K1 – Coherence-weighted fast OFI trend
+
+```go
+g1 := ks.Zf
+w1 := ks.WCoherence * ks.WActTrend * ks.WVolMid
+raw := w1 * g1
+return clamp(raw/(cfg.S1+eps), -1.0, 1.0)
+```
+
+* Yes: core micro alpha, scaled and clipped.
+* Using clip rather than tanh preserves linearity around the center.
+
+Only tuning knobs: `S1`, `AlphaCoherence`, `AlphaActTrend`, `VMid/Z0Mid`.
+
+Conceptually, this matches exactly.
+
+---
+
+### 5.2 K2 – Tail OFI burst
+
+```go
+z0 := ks.ZfAbsQ80.Current()
+z1 := ks.ZfAbsQ98.Current()
+if z1 < z0+0.5 { z1 = z0 + 0.5 }
+
+absZf := math.Abs(ks.Zf)
+excess := math.Max(absZf-z0, 0.0)
+tailFrac := clamp(excess/(z1-z0+eps), 0.0, 1.0)
+
+g2 := math.Copysign(tailFrac, ks.Zf)
+
+if ks.Zf*ks.RFastZ <= 0 {
+    g2 = 0.0
+}
+
+w2 := ks.WCoherence * ks.WActTail
+raw := w2 * g2
+return math.Tanh(cfg.B2 * raw)
+```
+
+This is very close to the improved version I described:
+
+* Tail defined via |Zf| quantiles, smoothly ramped from Q80→Q98.
+* Safety: `z1 >= z0 + 0.5` so denominator never collapses.
+* Price-flow alignment: `Zf*RFastZ > 0` required; excellent confirmation filter.
+* Activity & coherence weighting as intended.
+
+Only caveat: warm-up behavior:
+
+* Early in the day / symbol history, |Zf| quantiles may be miscalibrated. You might want a simple guard:
+
+  ```go
+  if !ks.ZfAbsQ80.Initialized || !ks.ZfAbsQ98.Initialized {
+      return 0.0
+  }
+  ```
+
+So K2 is silent until quantiles have seen some data.
+
+---
+
+### 5.3 K3 – Multi-scale alignment trend
+
+```go
+wSlowMag := math.Tanh(cfg.AlphaSlow * math.Abs(ks.Zs))
+corrLike := math.Tanh(cfg.AlphaAlign * ks.Zs * ks.Zf)
+wSlowDir := corrLike * wSlowMag
+alignment := (1.0 + wSlowDir) / 2.0
+
+g3 := alignment * ks.Zf
+w3 := ks.WCoherence * ks.WVolMid
+
+raw := w3 * g3
+return clamp(raw/(cfg.S3+eps), -1.0, 1.0)
+```
+
+This is *exactly* the smoothed alignment kernel we discussed:
+
+* `wSlowMag` grows with |Zs|.
+* `corrLike` is a smooth function of Zs*Zf; no hard sign boundary.
+* `alignment` lies in [0,1]; 1 for strong alignment, 0 for strong opposition, ~0.5 neutral.
+
+Result:
+
+* When Zs strong & aligned → K3 ~ Zf * positive factor.
+* When Zs strong & opposed → K3 ~ 0 (fast trend suppressed).
+* Neutral slow-trend → K3 ~ 0.5 * Zf.
+
+This is perfect.
+
+---
+
+### 5.4 K4 – Price/flow breakout continuation
+
+```go
+impMag := math.Tanh(cfg.AlphaR * math.Abs(ks.RFastZ))
+alignOK := ks.Zf*ks.RFastZ > 0
+
+var g4 float64
+if alignOK {
+    g4Mag := math.Min(math.Abs(ks.Zf), math.Abs(ks.RFastZ))
+    g4 = math.Copysign(g4Mag, ks.Zf)
+} else {
+    g4 = 0.0
+}
+
+wImp := impMag * ks.WVolHi * ks.WActTail * ks.WCoherence
+raw := wImp * (g4 / (cfg.S4 + eps))
+return math.Tanh(cfg.B4 * raw)
+```
+
+This aligns with the spec, including my later suggestion:
+
+* Uses both Zf and RFastZ in **magnitude** (min of the two).
+* Requires sign alignment.
+* Weights heavily on high vol (`WVolHi`) and high activity (`WActTail`).
+
+The only warning is the usual one: this kernel will structurally fire after big moves, so backtests must have realistic cost/impact modeling. The implementation itself looks correct.
+
+---
+
+### 5.5 K5 – Overstretch mean-reversion (contra)
+
+```go
+zE0 := 1.0
+excessE := math.Max(ks.ZElast-zE0, 0.0)
+wOver := math.Tanh(cfg.AlphaElastW * excessE)
+
+wFlat := 1.0 - math.Tanh(cfg.AlphaFlatSlow*math.Abs(ks.Zs))
+
+g5 := -ks.Zf
+w5 := wOver * wFlat * ks.WNoise * ks.WFlow
+
+raw := w5 * g5
+lin := raw / (cfg.S5 + eps)
+return clamp(lin, -cfg.KMax, cfg.KMax)
+```
+
+This matches the final design:
+
+* Overstretch: high elasticity (ZElast > 1); built on stabilized log-elast.
+* Flat slow trend: wFlat ~1 when |Zs| small, →0 when slow trend strong.
+* Noisy tape: WNoise high when coherence low.
+* Flow strength: WFlow ensures you only act when |Zf| is non-trivial.
+* Contra primitive: `-Zf`.
+* Hard cap `KMax` to keep it a small overlay.
+
+This is exactly how I would implement the risky contra kernel.
+
+---
+
+## 6. Coherence implementation
+
+```go
+func computeCoherence(c *Core, f WindowSnap) float64 {
+    N := f.Count
+    if N < 3 {
+        return 0
+    }
+    ...
+    prevSide := c.side[prevIdx]
+    ...
+    if prevSide > 0 {
+        cntP++
+        if curSide > 0 { npp++ } else { npm++ }
+    } else {
+        cntM++
+        if curSide > 0 { nmp++ } else { nmm++ }
+    }
+    ...
+    // build 2×2 transition probabilities, compute entropy h, C = 1 - h
+}
+```
+
+Main thing: this is consistent with your previous f4-style coherence. One subtle point:
+
+* You implicitly treat any `prevSide <= 0` as “minus,” including any possible zero. If `side` is strictly ±1, that’s fine; if you ever put 0 there for non-trades or placeholders, coherence will be off.
+
+Assuming `TradeSign(row)` returns ±1 only, this is okay.
+
+---
+
+## 7. Concrete fixes / suggestions
+
+You’re very close. I’d only consider these small changes:
+
+1. **Guard K2 on quantile initialization:**
+
+   ```go
+   if !ks.ZfAbsQ80.Initialized || !ks.ZfAbsQ98.Initialized {
+       return 0.0
+   }
+   ```
+
+2. **Optionally, separate alphas for EWVarR vs VolStat:**
+
+   * Add `AlphaSigma` and `AlphaVolStat` if you want different timescales later.
+
+3. **Warm-up handling:**
+   You might want a global `if !ks.Initialized` branch that zeroes all kernels for the first X trades to avoid weird early behavior, but that’s not strictly required.
+
+Beyond that, the code is a faithful, coherent implementation of the five-kernel design we converged on:
+
+* K1: core trend.
+* K2: tail overlay.
+* K3: multi-scale alignment.
+* K4: price/flow breakout.
+* K5: small contrarian overlay.
+
+So: yes, this captured it. Now the work is all in calibration and backtesting, not in the math.
+
+
+
 --- File Tree Structure ---
 |-- data/
 |-- common.go
@@ -9,6 +760,7 @@
 |-- sanity.go
     |-- BTCUSDT/
     |-- ETHUSDT/
+    |-- features/
         |-- 2020/
         |-- 2021/
         |-- 2022/
@@ -33,6 +785,12 @@
             |-- [01..12]/ (12 month dirs)
             |-- [01..12]/ (12 month dirs)
             |-- [01..11]/ (11 month dirs)
+        |-- BTCUSDT/
+        |-- ETHUSDT/
+            |-- 5D_Adaptive_Base/
+            |-- 5D_Adaptive_Fast/
+            |-- 5D_Adaptive_Base/
+            |-- 5D_Adaptive_Fast/
 
 // --- File: common.go ---
 
@@ -61,9 +819,18 @@ const (
 	AggMagic   = "AGG3"
 	IdxMagic   = "QIDX"
 	IdxVersion = 1
+
+	// Feature layout on disk:
+	//  - 5 dimensions
+	//  - float32 each (4 bytes)
+	//  - 20 bytes per row
+	FeatDims     = 5
+	FeatBytes    = 4
+	FeatRowBytes = FeatDims * FeatBytes
 )
 
 // Intern the symbol to keep it in L3 cache.
+// User Hardcode: Controls data download scope.
 var SymbolHandle = unique.Make("ETHUSDT")
 
 func Symbol() string { return SymbolHandle.Value() }
@@ -78,11 +845,11 @@ type AggRow struct {
 
 // ParseAggRow - ZEN 4 OPTIMIZED
 // Uses unsafe pointer arithmetic to bypass Go bounds checks.
-// The caller GUARANTEES row has at least 48 bytes and matches the AGG3 layout.
+// The caller GUARANTEES row has at least 48 bytes.
 func ParseAggRow(row []byte) AggRow {
 	ptr := unsafe.Pointer(&row[0])
 	return AggRow{
-		// Offset 38: Timestamp (uint64)
+		// Offset 38: Timestamp (uint64). Unaligned load handled by Zen 4.
 		TsMs: int64(*(*uint64)(unsafe.Add(ptr, 38))),
 		// Offset 8: Price (fixed-point, 1e-8)
 		PriceFixed: *(*uint64)(unsafe.Add(ptr, 8)),
@@ -101,19 +868,12 @@ func TradeQty(row AggRow) float64 {
 	return float64(row.QtyFixed) / QtScale
 }
 
-func TradeDollar(row AggRow) float64 {
-	return TradePrice(row) * TradeQty(row)
-}
-
 // TradeSign:
-//
-//	Flags&1 == 1  -> is_buyer_maker == true -> seller-initiated -> -1
-//	Flags&1 == 0  -> is_buyer_maker == false -> buyer-initiated  -> +1
+// Flags&1 == 1 -> is_buyer_maker == true -> seller-initiated -> -1
+// Flags&1 == 0 -> is_buyer_maker == false -> buyer-initiated -> +1
 func TradeSign(row AggRow) float64 {
-	if row.Flags&1 != 0 {
-		return -1.0
-	}
-	return 1.0
+	// Branchless optimization: 1 - 2*(bit)
+	return 1.0 - 2.0*float64(row.Flags&1)
 }
 ```
 
@@ -657,11 +1417,18 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"time"
 )
 
 func main() {
+	// Use all 7900X hardware threads.
 	runtime.GOMAXPROCS(CPUThreads)
+
+	// Hard memory limit: ~30GB heap.
+	// This is a guardrail on top of GOGC=200, not a replacement.
+	const ramLimit = 30 * 1024 * 1024 * 1024
+	debug.SetMemoryLimit(ramLimit)
 
 	if len(os.Args) < 2 {
 		printHelp()
@@ -670,7 +1437,7 @@ func main() {
 
 	start := time.Now()
 
-	fmt.Printf("Go 1.25.4 | Env: %s/%s | Threads: %d | GOGC: %s | AMD64: %s\n",
+	fmt.Printf("Go 1.25.4 | Env: %s/%s | Threads: %d | RAM Limit: 30GB | GOGC: %s | AMD64: %s\n",
 		runtime.GOOS, runtime.GOARCH,
 		runtime.GOMAXPROCS(0),
 		os.Getenv("GOGC"),
@@ -724,56 +1491,149 @@ import (
 	"sort"
 )
 
+// MetricStats is the finalized, human-readable view for one
+// feature × horizon × sample (IS/OOS).
+//
+// Important: BreakevenBps is computed as:
+//
+//	BreakevenBps = 1e4 * SumPnL / SumAbsDeltaSig
+//
+// where:
+//
+//	SumPnL        = Σ S_t * R_t
+//	SumAbsDeltaSig = Σ |S_t - S_{t-1}|
+//
+// Interpretation:
+//   - S_t is treated as a target position in "units of notional".
+//   - |S_t - S_{t-1}| is the notional TURNOVER per bar (one side).
+//   - BreakevenBps is the GROSS alpha at MID per 1 unit of notional
+//     traded (per side), in basis points.
+//
+// Trading-cost mapping:
+//
+//   - If your EFFECTIVE fee (including impact, spread, etc.) is F bps
+//     PER SIDE of notional traded, then
+//
+//     NetBpsPerSide = BreakevenBps - F
+//
+//   - Break-even fee per side (max fee you can pay and still be flat)
+//     is exactly:
+//
+//     F_max_per_side = BreakevenBps
+//
+//   - For a symmetric taker/taker model with per-side fee F_taker,
+//     a full roundtrip pays 2 * F_taker, but turnover sees BOTH sides
+//     separately, so you still compare BreakevenBps against F_taker
+//     (per side), not against 2 * F_taker.
 type MetricStats struct {
-	Count        int
-	ICPearson    float64
-	IC_TStat     float64 // Stability of IC across days
-	Sharpe       float64
-	HitRate      float64
+	Count int
+
+	// Cross-sectional edge
+	ICPearson float64 // Pearson IC over all aligned pairs
+	IC_TStat  float64 // t-stat of daily ICs (stability)
+
+	// PnL-quality
+	Sharpe  float64 // Sharpe of bar-level signal * return
+	HitRate float64 // Fraction of correct directional calls
+
+	// Economic edge (per turnover)
+	//
+	// Gross alpha at mid per 1 unit of notional traded (per side),
+	// in basis points. This is also the maximum fee PER SIDE (in bps)
+	// that a pure taker strategy can pay and still break even.
 	BreakevenBps float64
-	AutoCorr     float64 // Lag-1 autocorrelation of signal
+
+	// Signal dynamics
+	AutoCorr    float64 // Corr(S_t, S_{t-1})
+	AutoCorrAbs float64 // Corr(|S_t|, |S_{t-1}|)
+
+	AvgSegLen float64 // Average run length of same-sign segments (bars)
+	MaxSegLen float64 // Maximum observed same-sign run length (bars)
 }
 
+// Moments is the streaming accumulator over aligned pairs (S,R).
+// Multiple days are merged by .Add(), and then finalized by FinalizeMetrics.
+//
+// Interpretation for trading economics:
+//
+//   - S_t: signal interpreted as target position in "units of notional".
+//   - R_t: forward return over horizon (fractional, e.g. 0.001 = 10 bps).
+//   - PnL_t = S_t * R_t (per bar).
+//   - SumAbsDeltaSig = Σ |S_t - S_{t-1}| is total notional turnover (per side).
+//
+// Under this model, BreakevenBps = 1e4 * SumPnL / SumAbsDeltaSig
+// is the GROSS alpha at mid per 1 unit of notional traded per side.
 type Moments struct {
-	Count     float64
-	SumSig    float64
-	SumRet    float64
-	SumProd   float64
-	SumSqSig  float64
-	SumSqRet  float64
-	SumPnL    float64
-	SumSqPnL  float64
+	Count float64
+
+	// Signal/return stats
+	SumSig   float64
+	SumRet   float64
+	SumProd  float64
+	SumSqSig float64
+	SumSqRet float64
+
+	// PnL stats (per aligned bar)
+	SumPnL   float64
+	SumSqPnL float64
+
+	// Direction accuracy
 	Hits      float64
 	ValidHits float64
-	Turnover  float64
 
-	// New: Autocorrelation terms (lag 1)
-	SumProdLag  float64 // Σ(S_t * S_{t-1})
-	SumSqSigLag float64 // Σ(S_{t-1}^2)
+	// Turnover proxy (per-side notional traded)
+	SumAbsDeltaSig float64 // Σ |S_t - S_{t-1}|
+
+	// Autocorrelation (raw signal)
+	SumProdLag float64 // Σ S_t * S_{t-1}
+
+	// Autocorrelation (abs signal)
+	SumAbsSig     float64 // Σ |S_t|
+	SumAbsProdLag float64 // Σ |S_t| * |S_{t-1}|
+
+	// Segment statistics (runs of same sign)
+	SegCount    float64 // number of segments (non-zero sign runs)
+	SegLenTotal float64 // Σ length of segments in bars
+	SegLenMax   float64 // max segment length in bars
 }
 
 func (m *Moments) Add(m2 Moments) {
 	m.Count += m2.Count
+
 	m.SumSig += m2.SumSig
 	m.SumRet += m2.SumRet
 	m.SumProd += m2.SumProd
 	m.SumSqSig += m2.SumSqSig
 	m.SumSqRet += m2.SumSqRet
+
 	m.SumPnL += m2.SumPnL
 	m.SumSqPnL += m2.SumSqPnL
+
 	m.Hits += m2.Hits
 	m.ValidHits += m2.ValidHits
-	m.Turnover += m2.Turnover
+
+	m.SumAbsDeltaSig += m2.SumAbsDeltaSig
 	m.SumProdLag += m2.SumProdLag
-	m.SumSqSigLag += m2.SumSqSigLag
+
+	m.SumAbsSig += m2.SumAbsSig
+	m.SumAbsProdLag += m2.SumAbsProdLag
+
+	m.SegCount += m2.SegCount
+	m.SegLenTotal += m2.SegLenTotal
+	if m2.SegLenMax > m.SegLenMax {
+		m.SegLenMax = m2.SegLenMax
+	}
 }
 
-// CalcMomentsStream consumes a zero-alloc iterator and now also
-// accumulates lag-1 autocorrelation terms.
+// CalcMomentsStream: streaming version from an iterator (S,R).
+// Used where we don't need to materialize slices.
 func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 	var m Moments
+
 	first := true
-	prevSig := 0.0
+	var prevSig float64
+	var prevSign float64
+	var curSegLen float64
 
 	for s, r := range seq {
 		m.Count++
@@ -788,6 +1648,13 @@ func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 		m.SumPnL += pnl
 		m.SumSqPnL += pnl * pnl
 
+		absS := s
+		if absS < 0 {
+			absS = -absS
+		}
+		m.SumAbsSig += absS
+
+		// hit-rate: directional correctness
 		if s != 0 && r != 0 {
 			m.ValidHits++
 			if (s > 0 && r > 0) || (s < 0 && r < 0) {
@@ -795,28 +1662,186 @@ func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 			}
 		}
 
+		// dynamic metrics: turnover, autocorr, segments
 		if !first {
+			// turnover (per-side notional)
 			d := s - prevSig
 			if d < 0 {
 				d = -d
 			}
-			m.Turnover += d
+			m.SumAbsDeltaSig += d
 
-			// Lag-1 autocorr assuming mean ~ 0 (so we avoid a 2-pass mean correction).
+			// lag-1 signal autocorr
 			m.SumProdLag += s * prevSig
-			m.SumSqSigLag += prevSig * prevSig
+
+			// lag-1 abs(signal) autocorr
+			absPrev := prevSig
+			if absPrev < 0 {
+				absPrev = -absPrev
+			}
+			m.SumAbsProdLag += absS * absPrev
 		} else {
 			first = false
 		}
+
+		// segment statistics: runs of same non-zero sign
+		sign := 0.0
+		if s > 0 {
+			sign = 1.0
+		} else if s < 0 {
+			sign = -1.0
+		}
+
+		if sign != 0 {
+			if prevSign == sign {
+				// continuing segment
+				curSegLen++
+			} else {
+				// closing previous segment if any
+				if curSegLen > 0 {
+					m.SegCount++
+					m.SegLenTotal += curSegLen
+					if curSegLen > m.SegLenMax {
+						m.SegLenMax = curSegLen
+					}
+				}
+				// start new segment
+				curSegLen = 1
+			}
+		} else {
+			// zero signal closes any current segment
+			if curSegLen > 0 {
+				m.SegCount++
+				m.SegLenTotal += curSegLen
+				if curSegLen > m.SegLenMax {
+					m.SegLenMax = curSegLen
+				}
+				curSegLen = 0
+			}
+		}
+
 		prevSig = s
+		prevSign = sign
+	}
+
+	// flush last open segment
+	if curSegLen > 0 {
+		m.SegCount++
+		m.SegLenTotal += curSegLen
+		if curSegLen > m.SegLenMax {
+			m.SegLenMax = curSegLen
+		}
 	}
 
 	return m
 }
 
-// FinalizeMetrics now takes:
-//   - aggregated Moments across all days
-//   - dailyICs: slice of per-day ICs for this feature/horizon
+// CalcMomentsVectors: same math as CalcMomentsStream, but operating on
+// already-materialized slices of equal length.
+func CalcMomentsVectors(sigs, rets []float64) Moments {
+	var m Moments
+	n := len(sigs)
+	if n == 0 {
+		return m
+	}
+
+	var prevSig float64
+	var prevSign float64
+	var curSegLen float64
+
+	for i := 0; i < n; i++ {
+		s := sigs[i]
+		r := rets[i]
+
+		m.Count++
+
+		m.SumSig += s
+		m.SumRet += r
+		m.SumSqSig += s * s
+		m.SumSqRet += r * r
+		m.SumProd += s * r
+
+		pnl := s * r
+		m.SumPnL += pnl
+		m.SumSqPnL += pnl * pnl
+
+		absS := s
+		if absS < 0 {
+			absS = -absS
+		}
+		m.SumAbsSig += absS
+
+		if s != 0 && r != 0 {
+			m.ValidHits++
+			if (s > 0 && r > 0) || (s < 0 && r < 0) {
+				m.Hits++
+			}
+		}
+
+		if i > 0 {
+			d := s - prevSig
+			if d < 0 {
+				d = -d
+			}
+			m.SumAbsDeltaSig += d
+
+			m.SumProdLag += s * prevSig
+
+			absPrev := prevSig
+			if absPrev < 0 {
+				absPrev = -absPrev
+			}
+			m.SumAbsProdLag += absS * absPrev
+		}
+
+		sign := 0.0
+		if s > 0 {
+			sign = 1.0
+		} else if s < 0 {
+			sign = -1.0
+		}
+
+		if sign != 0 {
+			if prevSign == sign {
+				curSegLen++
+			} else {
+				if curSegLen > 0 {
+					m.SegCount++
+					m.SegLenTotal += curSegLen
+					if curSegLen > m.SegLenMax {
+						m.SegLenMax = curSegLen
+					}
+				}
+				curSegLen = 1
+			}
+		} else {
+			if curSegLen > 0 {
+				m.SegCount++
+				m.SegLenTotal += curSegLen
+				if curSegLen > m.SegLenMax {
+					m.SegLenMax = curSegLen
+				}
+				curSegLen = 0
+			}
+		}
+
+		prevSig = s
+		prevSign = sign
+	}
+
+	if curSegLen > 0 {
+		m.SegCount++
+		m.SegLenTotal += curSegLen
+		if curSegLen > m.SegLenMax {
+			m.SegLenMax = curSegLen
+		}
+	}
+
+	return m
+}
+
+// FinalizeMetrics turns low-level Moments + daily IC series into a compact
+// statistical view (MetricStats).
 func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 	if m.Count <= 1 {
 		return MetricStats{Count: int(m.Count)}
@@ -824,7 +1849,7 @@ func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 
 	ms := MetricStats{Count: int(m.Count)}
 
-	// 1. Pearson IC on the full sample
+	// 1. Pearson IC over all aligned pairs.
 	num := m.Count*m.SumProd - m.SumSig*m.SumRet
 	denX := m.Count*m.SumSqSig - m.SumSig*m.SumSig
 	denY := m.Count*m.SumSqRet - m.SumRet*m.SumRet
@@ -832,61 +1857,82 @@ func FinalizeMetrics(m Moments, dailyICs []float64) MetricStats {
 		ms.ICPearson = num / math.Sqrt(denX*denY)
 	}
 
-	// 2. Sharpe on PnL (per-bar)
+	// 2. Sharpe of bar-level signal * return.
 	meanPnL := m.SumPnL / m.Count
-	varPnL := (m.SumSqPnL / m.Count) - (meanPnL * meanPnL)
-	if varPnL > 0 {
+	varPnL := (m.SumSqPnL / m.Count) - meanPnL*meanPnL
+	if varPnL > 1e-18 {
 		ms.Sharpe = meanPnL / math.Sqrt(varPnL)
 	}
 
-	// 3. Hit Rate
+	// 3. Hit rate.
 	if m.ValidHits > 0 {
 		ms.HitRate = m.Hits / m.ValidHits
 	}
 
-	// 4. Breakeven bps per unit turnover
-	if m.Turnover > 0 {
-		ms.BreakevenBps = (m.SumPnL / m.Turnover) * 10000.0
+	// 4. Breakeven bps per unit turnover (per-side notional):
+	//    gross alpha at mid per 1 unit of notional traded, in bps.
+	if m.SumAbsDeltaSig > 1e-18 {
+		ms.BreakevenBps = (m.SumPnL / m.SumAbsDeltaSig) * 10000.0
 	}
 
-	// 5. Lag-1 Autocorrelation
-	// Corr ≈ SumProdLag / sqrt(SumSqSig * SumSqSigLag)
-	if m.SumSqSig > 0 && m.SumSqSigLag > 0 {
-		ms.AutoCorr = m.SumProdLag / math.Sqrt(m.SumSqSig*m.SumSqSigLag)
+	// 5. Lag-1 autocorrelation of S_t (mean-corrected).
+	meanSig := m.SumSig / m.Count
+	covLag := (m.SumProdLag / m.Count) - meanSig*meanSig
+	varSig := (m.SumSqSig / m.Count) - meanSig*meanSig
+	if varSig > 1e-18 {
+		ms.AutoCorr = covLag / varSig
 	}
 
-	// 6. IC Stability (t-stat over daily ICs)
+	// 6. Lag-1 autocorrelation of |S_t|.
+	if m.Count > 0 {
+		meanAbs := m.SumAbsSig / m.Count
+		covAbs := (m.SumAbsProdLag / m.Count) - meanAbs*meanAbs
+		// var(|S|) uses same SumSqSig (since |S|^2 == S^2)
+		varAbs := (m.SumSqSig / m.Count) - meanAbs*meanAbs
+		if varAbs > 1e-18 {
+			ms.AutoCorrAbs = covAbs / varAbs
+		}
+	}
+
+	// 7. Segment statistics: average/max run length of same-sign signal.
+	if m.SegCount > 0 {
+		ms.AvgSegLen = m.SegLenTotal / m.SegCount
+	}
+	ms.MaxSegLen = m.SegLenMax
+
+	// 8. IC Stability: t-stat of daily ICs.
 	if len(dailyICs) > 1 {
 		var sum, sumSq float64
+		n := float64(len(dailyICs))
 		for _, v := range dailyICs {
 			sum += v
 			sumSq += v * v
 		}
-		mean := sum / float64(len(dailyICs))
-		variance := (sumSq / float64(len(dailyICs))) - (mean * mean)
-		if variance > 0 {
+		mean := sum / n
+		variance := (sumSq / n) - mean*mean
+		if variance > 1e-18 {
 			stdDev := math.Sqrt(variance)
-			ms.IC_TStat = mean / (stdDev / math.Sqrt(float64(len(dailyICs))))
+			ms.IC_TStat = mean / (stdDev / math.Sqrt(n))
 		}
 	}
 
 	return ms
 }
 
-// --- Quantile Math (Monotonicity) ---
+// --- Quantile / Monotonicity Math ---
 
 type BucketResult struct {
-	ID        int // 1..numBuckets
+	ID        int
 	AvgSig    float64
 	AvgRetBps float64
 	Count     int
 }
 
-// ComputeQuantiles: signal monotonicity / shape check.
-// Sorts all (sig, ret) pairs into numBuckets buckets by signal value.
+// ComputeQuantiles sorts (sig, ret) pairs by signal and splits into
+// numBuckets groups, returning per-bucket statistics.
 func ComputeQuantiles(sigs, rets []float64, numBuckets int) []BucketResult {
 	n := len(sigs)
-	if n == 0 || numBuckets <= 0 {
+	if n == 0 || numBuckets <= 0 || len(rets) != n {
 		return nil
 	}
 
@@ -925,19 +1971,45 @@ func ComputeQuantiles(sigs, rets []float64, numBuckets int) []BucketResult {
 			sumR += pairs[i].r
 			count++
 		}
-		if count == 0 {
-			continue
-		}
-
-		results[b] = BucketResult{
-			ID:        b + 1,
-			AvgSig:    sumS / float64(count),
-			AvgRetBps: (sumR / float64(count)) * 10000.0,
-			Count:     count,
+		if count > 0 {
+			results[b] = BucketResult{
+				ID:        b + 1,
+				AvgSig:    sumS / float64(count),
+				AvgRetBps: (sumR / float64(count)) * 10000.0,
+				Count:     count,
+			}
 		}
 	}
-
 	return results
+}
+
+// BucketAgg aggregates bucket results across days.
+type BucketAgg struct {
+	Count     int
+	SumSig    float64
+	SumRetBps float64
+}
+
+func (ba *BucketAgg) Add(br BucketResult) {
+	if br.Count <= 0 {
+		return
+	}
+	ba.Count += br.Count
+	ba.SumSig += br.AvgSig * float64(br.Count)
+	ba.SumRetBps += br.AvgRetBps * float64(br.Count)
+}
+
+func (ba BucketAgg) Finalize(id int) BucketResult {
+	if ba.Count == 0 {
+		return BucketResult{ID: id}
+	}
+	den := float64(ba.Count)
+	return BucketResult{
+		ID:        id,
+		AvgSig:    ba.SumSig / den,
+		AvgRetBps: ba.SumRetBps / den,
+		Count:     ba.Count,
+	}
 }
 ```
 
@@ -963,17 +2035,18 @@ import (
 	"time"
 )
 
-const BuildMaxRows = 10_000_000
+const (
+	BuildMaxRows = 10_000_000
+	eps          = 1e-12
+)
 
-// --- Configuration ---
+// --- Builder Configuration ---
 
 type FiveDimConfig struct {
-	RingSize     int
-	Lfast, Lslow float64
-	VarAlphaB    float64 // EWMA alpha for B variance
-	AlphaAbs     float64 // EWMA alpha for Absorption Baseline
-	VarAlphaS    float64 // EWMA alpha for Surplus variance
-	AlphaE       float64 // EWMA alpha for Elasticity reference
+	RingSize  int
+	Lfast     float64 // information-time fast length
+	Lslow     float64 // information-time slow length
+	VarAlphaB float64 // EW decay for B^2
 }
 
 type VariantDef struct {
@@ -981,25 +2054,22 @@ type VariantDef struct {
 	Cfg FiveDimConfig
 }
 
-// Optimized Task: Carries the exact file location to avoid redundant lookups.
 type ofiTask struct {
 	Y, M, D        int
 	Offset, Length int64
 }
 
+// --- Main Builder Entry ---
+
 func runBuild() {
 	start := time.Now()
 
 	// Adaptive Base Config
-	// Lfast=2.0 (info-time), Lslow=300 (info-time) ~ roughly 2s and 5m in volume-time terms
 	baseCfg := FiveDimConfig{
 		RingSize:  20_000,
 		Lfast:     2.0,
 		Lslow:     300.0,
-		VarAlphaB: 0.001, // slow variance decay
-		AlphaAbs:  0.01,  // absorption baseline adaptation
-		VarAlphaS: 0.005,
-		AlphaE:    0.001,
+		VarAlphaB: 0.001,
 	}
 
 	variants := []VariantDef{
@@ -1016,7 +2086,7 @@ func runBuild() {
 	}
 
 	symbols := discoverSymbols()
-	fmt.Printf("--- FEATURE BUILDER (5D Adaptive) | Found Symbols: %v ---\n", symbols)
+	fmt.Printf("--- FEATURE BUILDER (5D O(1) Engine) | Found Symbols: %v ---\n", symbols)
 
 	for _, sym := range symbols {
 		buildForSymbol(sym, variants)
@@ -1070,15 +2140,12 @@ func buildVariant(sym string, v VariantDef, tasks []ofiTask, featRoot string) {
 	jobs := make(chan ofiTask, len(tasks))
 	var wg sync.WaitGroup
 
-	workers := CPUThreads
-
-	for i := 0; i < workers; i++ {
+	for i := 0; i < CPUThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Buffer: 10M rows * 5 features * 8 bytes = 400MB max per day
-			// We reuse this buffer across days for this worker.
-			binBuf := make([]byte, 0, BuildMaxRows*5*8)
+			// Reusable buffer; sized for max rows with current feature layout.
+			binBuf := make([]byte, 0, BuildMaxRows*FeatRowBytes)
 			for t := range jobs {
 				processBuildDay(sym, t, outDir, v.Cfg, &binBuf)
 			}
@@ -1114,24 +2181,23 @@ func processBuildDay(
 	}
 
 	n := int(rowCount)
-	// Output: 5 float64s per row
-	reqSize := n * 5 * 8
+	reqSize := n * FeatRowBytes
 	if cap(*binBuf) < reqSize {
 		*binBuf = make([]byte, reqSize)
 	}
 	*binBuf = (*binBuf)[:reqSize]
 
-	// Init Engine
-	core := NewCore(cfg.RingSize, cfg.Lfast, cfg.Lslow, cfg.VarAlphaB, cfg.AlphaAbs, cfg.VarAlphaS, cfg.AlphaE)
+	// Init O(1) Engine
+	core := NewCore(cfg.RingSize, cfg.Lfast, cfg.Lslow, cfg.VarAlphaB)
 	engine := NewEngine(core)
 
-	// Process
+	// Process Rows
 	for i := 0; i < n; i++ {
 		off := i * RowSize
 		row := ParseAggRow(rawBytes[off : off+RowSize])
 
 		tr := Trade{
-			Side:  TradeSign(row), // +1 or -1
+			Side:  TradeSign(row),
 			Qty:   TradeQty(row),
 			Price: TradePrice(row),
 			Ts:    row.TsMs,
@@ -1139,12 +2205,13 @@ func processBuildDay(
 
 		feats := engine.Update(tr)
 
-		baseOff := i * 40 // 5 * 8
-		binary.LittleEndian.PutUint64((*binBuf)[baseOff+0:], math.Float64bits(feats[0]))
-		binary.LittleEndian.PutUint64((*binBuf)[baseOff+8:], math.Float64bits(feats[1]))
-		binary.LittleEndian.PutUint64((*binBuf)[baseOff+16:], math.Float64bits(feats[2]))
-		binary.LittleEndian.PutUint64((*binBuf)[baseOff+24:], math.Float64bits(feats[3]))
-		binary.LittleEndian.PutUint64((*binBuf)[baseOff+32:], math.Float64bits(feats[4]))
+		// Write 5 features interleaved as float32 on disk.
+		baseOff := i * FeatRowBytes
+		binary.LittleEndian.PutUint32((*binBuf)[baseOff+0:], math.Float32bits(float32(feats[0])))
+		binary.LittleEndian.PutUint32((*binBuf)[baseOff+4:], math.Float32bits(float32(feats[1])))
+		binary.LittleEndian.PutUint32((*binBuf)[baseOff+8:], math.Float32bits(float32(feats[2])))
+		binary.LittleEndian.PutUint32((*binBuf)[baseOff+12:], math.Float32bits(float32(feats[3])))
+		binary.LittleEndian.PutUint32((*binBuf)[baseOff+16:], math.Float32bits(float32(feats[4])))
 	}
 
 	if err := os.WriteFile(outPath, *binBuf, 0o644); err != nil {
@@ -1152,160 +2219,140 @@ func processBuildDay(
 	}
 }
 
-// --- 5D Engine Core ---
+// --- 5D Adaptive Core (O(1) Info-Time Engine) ---
+
+type Core struct {
+	N    int
+	head int64 // Monotonic trade counter
+
+	// Ring Data (Access via head % N)
+	u     []float64
+	side  []float64
+	price []float64
+	info  []float64 // Absolute Cumulative info-time
+
+	// O(1) Sliding Window State
+	startF  int64   // Index of Fast window start
+	startS  int64   // Index of Slow window start
+	accumBf float64 // Running sum of u (Fast)
+	accumBs float64 // Running sum of u (Slow)
+	countF  int
+	countS  int
+
+	// Config
+	Lfast, Lslow float64
+
+	// EW variance of Bf and Bs
+	EWVarBf, EWVarBs, VarAlphaB float64
+}
 
 type Trade struct {
-	Side  float64
-	Qty   float64
-	Price float64
-	Ts    int64
+	Side, Qty, Price float64
+	Ts               int64
 }
 
 type WindowSnap struct {
-	Start      int
-	Count      int
-	B          float64
-	PriceFirst float64
-	PriceLast  float64
+	Start, Count          int
+	B                     float64
+	PriceFirst, PriceLast float64
 }
 
 type SnapPair struct {
-	Fast WindowSnap
-	Slow WindowSnap
+	Fast, Slow WindowSnap
 }
 
-type Core struct {
-	N      int
-	idx    int64
-	filled bool
-
-	u     []float64
-	side  []float64
-	qty   []float64
-	price []float64
-	ts    []int64
-	info  []float64 // cumulative info-time
-
-	Lfast float64
-	Lslow float64
-
-	// EW Vars
-	EWVarBf   float64
-	EWVarBs   float64
-	VarAlphaB float64
-
-	// SFA
-	AbsBaseline float64
-	AlphaAbs    float64
-	EWVarS      float64
-	VarAlphaS   float64
-
-	// Elasticity
-	ERef   float64
-	AlphaE float64
-}
-
-func NewCore(N int, Lfast, Lslow, varAlphaB, alphaAbs, varAlphaS, alphaE float64) *Core {
+func NewCore(N int, Lfast, Lslow, varAlphaB float64) *Core {
 	return &Core{
 		N:         N,
 		u:         make([]float64, N),
 		side:      make([]float64, N),
-		qty:       make([]float64, N),
 		price:     make([]float64, N),
-		ts:        make([]int64, N),
 		info:      make([]float64, N),
 		Lfast:     Lfast,
 		Lslow:     Lslow,
 		VarAlphaB: varAlphaB,
-		AlphaAbs:  alphaAbs,
-		VarAlphaS: varAlphaS,
-		AlphaE:    alphaE,
 	}
 }
 
+// Update ingests a trade and returns the fast/slow window snapshots.
 func (c *Core) Update(tr Trade) SnapPair {
-	slot := int(c.idx % int64(c.N))
+	slot := int(c.head % int64(c.N))
 
-	// u_i = s_i * sqrt(V_i)
+	// 1. Information unit
 	u := tr.Side * math.Sqrt(tr.Qty)
 
 	var prevInfo float64
-	if c.idx > 0 {
-		prevInfo = c.info[(c.idx-1)%int64(c.N)]
+	if c.head > 0 {
+		prevInfo = c.info[int((c.head-1)%int64(c.N))]
 	}
-	info := prevInfo + math.Abs(u)
+	infoNow := prevInfo + math.Abs(u)
 
+	// 2. Update ring
 	c.u[slot] = u
 	c.side[slot] = tr.Side
-	c.qty[slot] = tr.Qty
 	c.price[slot] = tr.Price
-	c.ts[slot] = tr.Ts
-	c.info[slot] = info
+	c.info[slot] = infoNow
 
-	c.idx++
-	if c.idx >= int64(c.N) {
-		c.filled = true
-	}
+	// 3. Add to accumulators
+	c.accumBf += u
+	c.accumBs += u
+	c.countF++
+	c.countS++
 
-	return c.buildSnaps()
-}
-
-func (c *Core) buildSnaps() SnapPair {
-	if c.idx == 0 {
-		return SnapPair{}
-	}
-	lastPos := int((c.idx - 1) % int64(c.N))
-	infoNow := c.info[lastPos]
-
-	var Bf, Bs float64
-	var countF, countS int
-	startF, startS := lastPos, lastPos
-
-	limit := c.N
-	if int64(limit) > c.idx {
-		limit = int(c.idx)
-	}
-
-	for k := 0; k < limit; k++ {
-		i := (lastPos - k + c.N) % c.N
-
-		// infoNow - info[i] = sum_{j=i+1..last} |u_j|
-		dist := infoNow - c.info[i]
-		if dist > c.Lslow {
+	// 4. Shrink fast window
+	for c.startF < c.head {
+		var infoPrev float64
+		if c.startF > 0 {
+			infoPrev = c.info[int((c.startF-1)%int64(c.N))]
+		}
+		if (infoNow - infoPrev) > c.Lfast {
+			idxF := int(c.startF % int64(c.N))
+			c.accumBf -= c.u[idxF]
+			c.countF--
+			c.startF++
+		} else {
 			break
 		}
+	}
 
-		Bs += c.u[i]
-		countS++
-		startS = i
-
-		if dist <= c.Lfast {
-			Bf += c.u[i]
-			countF++
-			startF = i
+	// Shrink slow window
+	for c.startS < c.head {
+		var infoPrev float64
+		if c.startS > 0 {
+			infoPrev = c.info[int((c.startS-1)%int64(c.N))]
+		}
+		if (infoNow - infoPrev) > c.Lslow {
+			idxS := int(c.startS % int64(c.N))
+			c.accumBs -= c.u[idxS]
+			c.countS--
+			c.startS++
+		} else {
+			break
 		}
 	}
 
-	var fast, slow WindowSnap
-	if countF > 0 {
-		fast = WindowSnap{
-			Start:      startF,
-			Count:      countF,
-			B:          Bf,
-			PriceFirst: c.price[startF],
-			PriceLast:  c.price[lastPos],
-		}
+	// 5. Construct snaps
+	idxF := int(c.startF % int64(c.N))
+	idxS := int(c.startS % int64(c.N))
+
+	fast := WindowSnap{
+		Start:      idxF,
+		Count:      c.countF,
+		B:          c.accumBf,
+		PriceFirst: c.price[idxF],
+		PriceLast:  tr.Price,
 	}
-	if countS > 0 {
-		slow = WindowSnap{
-			Start:      startS,
-			Count:      countS,
-			B:          Bs,
-			PriceFirst: c.price[startS],
-			PriceLast:  c.price[lastPos],
-		}
+	slow := WindowSnap{
+		Start:      idxS,
+		Count:      c.countS,
+		B:          c.accumBs,
+		PriceFirst: c.price[idxS],
+		PriceLast:  tr.Price,
 	}
 
+	c.head++
+
+	// 6. Update EW variance of Bf / Bs
 	if fast.Count > 0 {
 		diff2 := fast.B * fast.B
 		if c.EWVarBf == 0 {
@@ -1326,16 +2373,20 @@ func (c *Core) buildSnaps() SnapPair {
 	return SnapPair{Fast: fast, Slow: slow}
 }
 
-// --- Feature Engine ---
+// --- Kernel Feature Engine (new K1–K5 math) ---
 
-type FeatureVector [5]float64
+type FeatureVector [FeatDims]float64
 
 type Engine struct {
 	Core *Core
+	KS   KernelState
 }
 
 func NewEngine(core *Core) *Engine {
-	return &Engine{Core: core}
+	return &Engine{
+		Core: core,
+		KS:   NewKernelState(DefaultKernelConfig()),
+	}
 }
 
 func (e *Engine) Update(tr Trade) FeatureVector {
@@ -1343,87 +2394,430 @@ func (e *Engine) Update(tr Trade) FeatureVector {
 	fSnap := snaps.Fast
 	sSnap := snaps.Slow
 
+	// If windows are too small, still update state but expect features ~0.
 	if fSnap.Count == 0 || sSnap.Count == 0 {
-		return FeatureVector{}
+		// We still compute coherence on the fast snapshot; this returns 0 if N<3.
+		C := computeCoherence(e.Core, fSnap)
+		return e.KS.Update(e.Core, fSnap, sSnap, C)
 	}
 
-	f1 := e.f1_Zfast(fSnap)
-	f2 := e.f2_SFA(fSnap)
-	f3 := e.f3_Elasticity(fSnap)
-	f4 := e.f4_Coherence(fSnap)
-	f5 := e.f5_Align(fSnap, sSnap, f4)
-
-	return FeatureVector{f1, f2, f3, f4, f5}
+	C := computeCoherence(e.Core, fSnap)
+	return e.KS.Update(e.Core, fSnap, sSnap, C)
 }
 
-// f1: Normalized Imbalance (Fast)
-func (e *Engine) f1_Zfast(f WindowSnap) float64 {
-	scale := math.Sqrt(e.Core.EWVarBf + 1e-12)
-	return math.Tanh(f.B / (scale + 1e-12))
+// --- Online stats abstractions ---
+
+type EWStat struct {
+	Alpha       float64
+	Mean        float64
+	Var         float64
+	Initialized bool
 }
 
-// f2: SFA (Surplus Flow vs Absorption)
-func (e *Engine) f2_SFA(f WindowSnap) float64 {
-	c := e.Core
-	B := f.B
-	absB := math.Abs(B)
+func (s *EWStat) Update(x float64) {
+	if s.Alpha <= 0 {
+		return
+	}
+	if !s.Initialized {
+		s.Mean = x
+		s.Var = 0.0
+		s.Initialized = true
+		return
+	}
+	a := s.Alpha
+	mOld := s.Mean
+	mNew := (1-a)*mOld + a*x
+	diff := x - mNew
+	vNew := (1-a)*s.Var + a*diff*diff
 
-	if c.AbsBaseline == 0 {
-		c.AbsBaseline = absB
+	s.Mean = mNew
+	s.Var = vNew
+}
+
+func (s *EWStat) Std() float64 {
+	if !s.Initialized {
+		return 0.0
+	}
+	return math.Sqrt(math.Max(s.Var, 0.0))
+}
+
+func (s *EWStat) ZScore(x float64) float64 {
+	std := s.Std()
+	if std <= 0 {
+		return 0.0
+	}
+	return (x - s.Mean) / (std + eps)
+}
+
+// Robbins–Monro online quantile
+type EWQuantile struct {
+	Q           float64
+	Step        float64
+	Value       float64
+	Initialized bool
+}
+
+func (q *EWQuantile) Update(x float64) {
+	if q.Step <= 0 {
+		return
+	}
+	if !q.Initialized {
+		q.Value = x
+		q.Initialized = true
+		return
+	}
+	theta := q.Value
+	if x <= theta {
+		q.Value = theta - q.Step*(1.0-q.Q)
 	} else {
-		c.AbsBaseline = (1-c.AlphaAbs)*c.AbsBaseline + c.AlphaAbs*absB
+		q.Value = theta + q.Step*q.Q
 	}
-
-	surplus := absB - c.AbsBaseline
-	if surplus <= 0 {
-		return 0
-	}
-	S := math.Copysign(surplus, B)
-
-	diff2 := S * S
-	if c.EWVarS == 0 {
-		c.EWVarS = diff2
-	} else {
-		c.EWVarS = (1-c.VarAlphaS)*c.EWVarS + c.VarAlphaS*diff2
-	}
-	scale := math.Sqrt(c.EWVarS + 1e-12)
-	return math.Tanh(S / (scale + 1e-12))
 }
 
-// f3: Elasticity (dP / Flow)
-func (e *Engine) f3_Elasticity(f WindowSnap) float64 {
-	c := e.Core
+func (q *EWQuantile) Current() float64 {
+	if !q.Initialized {
+		return 0.0
+	}
+	return q.Value
+}
+
+// --- Kernel configuration ---
+
+type KernelConfig struct {
+	// EW alphas for second-level stats
+	AlphaVol      float64
+	AlphaAct      float64
+	AlphaC        float64
+	AlphaElast    float64
+	AlphaQuantile float64
+
+	// Weight hyperparameters
+	AlphaCoherence float64
+	AlphaActTrend  float64
+	AlphaActTail   float64
+	AlphaFlow      float64
+	AlphaAlign     float64
+	AlphaSlow      float64
+	AlphaR         float64
+	AlphaElastW    float64
+	AlphaFlatSlow  float64
+
+	// Vol regime parameters
+	VMid  float64
+	Z0Mid float64
+	ZHi0  float64
+	VHi   float64
+
+	// Scale / caps
+	S1   float64
+	S3   float64
+	S4   float64
+	S5   float64
+	B2   float64
+	B4   float64
+	KMax float64
+}
+
+func DefaultKernelConfig() KernelConfig {
+	return KernelConfig{
+		AlphaVol:      0.01,
+		AlphaAct:      0.01,
+		AlphaC:        0.01,
+		AlphaElast:    0.01,
+		AlphaQuantile: 0.005,
+
+		AlphaCoherence: 0.7,
+		AlphaActTrend:  0.7,
+		AlphaActTail:   1.0,
+		AlphaFlow:      0.5,
+		AlphaAlign:     0.3,
+		AlphaSlow:      0.7,
+		AlphaR:         0.7,
+		AlphaElastW:    0.7,
+		AlphaFlatSlow:  0.7,
+
+		VMid:  1.5,
+		Z0Mid: 0.75,
+		ZHi0:  0.5,
+		VHi:   1.5,
+
+		S1:   3.0,
+		S3:   3.0,
+		S4:   3.0,
+		S5:   2.0,
+		B2:   1.5,
+		B4:   1.0,
+		KMax: 0.4,
+	}
+}
+
+// --- Kernel state (per-symbol) ---
+
+type KernelState struct {
+	Cfg KernelConfig
+
+	// Second-level EW stats
+	VolStat   EWStat
+	ActStat   EWStat
+	CoherStat EWStat
+	ElastStat EWStat
+
+	ZfAbsQ80 EWQuantile
+	ZfAbsQ98 EWQuantile
+
+	// Internal vol of price impulse
+	EWVarR float64
+
+	// Latest normalized quantities
+	Zf, Zs              float64
+	ZVol, ZAct, CZ      float64
+	RFastZ, ZElast      float64
+	WCoherence          float64
+	WVolMid, WVolHi     float64
+	WActTrend, WActTail float64
+	WNoise, WFlow       float64
+
+	Initialized bool
+}
+
+func NewKernelState(cfg KernelConfig) KernelState {
+	return KernelState{
+		Cfg:       cfg,
+		VolStat:   EWStat{Alpha: cfg.AlphaVol},
+		ActStat:   EWStat{Alpha: cfg.AlphaAct},
+		CoherStat: EWStat{Alpha: cfg.AlphaC},
+		ElastStat: EWStat{Alpha: cfg.AlphaElast},
+		ZfAbsQ80:  EWQuantile{Q: 0.80, Step: cfg.AlphaQuantile},
+		ZfAbsQ98:  EWQuantile{Q: 0.98, Step: cfg.AlphaQuantile},
+	}
+}
+
+// Update full state given current windows and coherence; return K1..K5.
+func (ks *KernelState) Update(core *Core, f, s WindowSnap, coherence float64) FeatureVector {
+	cfg := ks.Cfg
+
+	// 1) Zf, Zs from EWVarBf/EWVarBs (assume zero-mean B).
+	if core.EWVarBf > 0 {
+		ks.Zf = f.B / (math.Sqrt(core.EWVarBf) + eps)
+	} else {
+		ks.Zf = 0
+	}
+	if core.EWVarBs > 0 {
+		ks.Zs = s.B / (math.Sqrt(core.EWVarBs) + eps)
+	} else {
+		ks.Zs = 0
+	}
+
+	// 2) Fast price impulse and volatility.
+	rFast := 0.0
+	if f.PriceFirst > 0 {
+		rFast = (f.PriceLast - f.PriceFirst) / (f.PriceFirst + eps)
+	}
+
+	r2 := rFast * rFast
+	if r2 > 0 {
+		if ks.EWVarR == 0 {
+			ks.EWVarR = r2
+		} else {
+			a := cfg.AlphaVol
+			ks.EWVarR = (1-a)*ks.EWVarR + a*r2
+		}
+	}
+	sigma := math.Sqrt(ks.EWVarR + eps)
+
+	if sigma > 0 {
+		xVol := math.Log(sigma + eps)
+		ks.VolStat.Update(xVol)
+		ks.ZVol = ks.VolStat.ZScore(xVol)
+	} else {
+		ks.ZVol = 0
+	}
+
+	// 3) Activity proxy: number of trades in fast window.
+	actRaw := float64(f.Count)
+	if actRaw < 1 {
+		actRaw = 1
+	}
+	xAct := math.Log(actRaw)
+	ks.ActStat.Update(xAct)
+	ks.ZAct = ks.ActStat.ZScore(xAct)
+
+	// 4) Coherence normalization.
+	ks.CoherStat.Update(coherence)
+	ks.CZ = ks.CoherStat.ZScore(coherence)
+
+	// 5) r_fast_z
+	if sigma > 0 {
+		ks.RFastZ = rFast / (sigma + eps)
+	} else {
+		ks.RFastZ = 0
+	}
+
+	// 6) Elasticity (price move per unit OFI).
 	dP := f.PriceLast - f.PriceFirst
-	Q := f.B
-	eMag := math.Abs(dP) / (math.Abs(Q) + 1e-12)
+	eMag := math.Abs(dP) / (math.Abs(f.B) + eps)
+	xEl := 0.0
+	if eMag > 0 {
+		xEl = math.Log(eMag + eps)
+	}
+	ks.ElastStat.Update(xEl)
+	ks.ZElast = ks.ElastStat.ZScore(xEl)
 
-	if c.ERef == 0 {
-		c.ERef = eMag
+	// 7) Quantiles of |Zf|.
+	absZf := math.Abs(ks.Zf)
+	ks.ZfAbsQ80.Update(absZf)
+	ks.ZfAbsQ98.Update(absZf)
+
+	// 8) Weights.
+
+	// Coherence weight
+	wCoherence := softstep(ks.CZ, cfg.AlphaCoherence)
+	ks.WCoherence = clamp(wCoherence, 0.05, 0.99)
+
+	// Mid-vol weight
+	u := math.Max(math.Abs(ks.ZVol)-cfg.Z0Mid, 0.0)
+	if cfg.VMid > 0 {
+		ks.WVolMid = 1.0 / (1.0 + (u/cfg.VMid)*(u/cfg.VMid))
 	} else {
-		c.ERef = (1-c.AlphaE)*c.ERef + c.AlphaE*eMag
+		ks.WVolMid = 1.0
 	}
 
-	r := eMag / (c.ERef + 1e-12)
-	return math.Tanh(r)
+	// High-vol weight
+	v := math.Max(ks.ZVol-cfg.ZHi0, 0.0)
+	if cfg.VHi > 0 {
+		ks.WVolHi = 1.0 - 1.0/(1.0+(v/cfg.VHi)*(v/cfg.VHi))
+	} else {
+		ks.WVolHi = 0.0
+	}
+
+	// Activity weights
+	baseTrend := softstep(ks.ZAct, cfg.AlphaActTrend)
+	ks.WActTrend = clamp(0.3+0.7*baseTrend, 0.3, 1.0)
+	ks.WActTail = softstep(ks.ZAct, cfg.AlphaActTail)
+
+	// Noise and flow strength
+	ks.WNoise = clamp(1.0-ks.WCoherence, 0.0, 0.95)
+	ks.WFlow = math.Tanh(cfg.AlphaFlow * math.Abs(ks.Zf))
+
+	ks.Initialized = true
+
+	// 9) Kernels
+	k1 := ks.computeK1()
+	k2 := ks.computeK2()
+	k3 := ks.computeK3()
+	k4 := ks.computeK4()
+	k5 := ks.computeK5()
+
+	return FeatureVector{k1, k2, k3, k4, k5}
 }
 
-// f4: Coherence (Entropy of Sign Process)
-func (e *Engine) f4_Coherence(f WindowSnap) float64 {
-	c := e.Core
+// K1 – Coherence-weighted fast OFI trend.
+func (ks *KernelState) computeK1() float64 {
+	cfg := ks.Cfg
+	g1 := ks.Zf
+	w1 := ks.WCoherence * ks.WActTrend * ks.WVolMid
+	raw := w1 * g1
+	return clamp(raw/(cfg.S1+eps), -1.0, 1.0)
+}
+
+// K2 – Tail OFI burst.
+func (ks *KernelState) computeK2() float64 {
+	cfg := ks.Cfg
+
+	z0 := ks.ZfAbsQ80.Current()
+	z1 := ks.ZfAbsQ98.Current()
+	if z1 < z0+0.5 {
+		z1 = z0 + 0.5
+	}
+
+	absZf := math.Abs(ks.Zf)
+	excess := math.Max(absZf-z0, 0.0)
+	tailFrac := clamp(excess/(z1-z0+eps), 0.0, 1.0)
+
+	g2 := math.Copysign(tailFrac, ks.Zf)
+
+	// Optional confirmation: only when price and flow agree.
+	if ks.Zf*ks.RFastZ <= 0 {
+		g2 = 0.0
+	}
+
+	w2 := ks.WCoherence * ks.WActTail
+	raw := w2 * g2
+	return math.Tanh(cfg.B2 * raw)
+}
+
+// K3 – Multi-scale alignment trend.
+func (ks *KernelState) computeK3() float64 {
+	cfg := ks.Cfg
+
+	wSlowMag := math.Tanh(cfg.AlphaSlow * math.Abs(ks.Zs))
+	corrLike := math.Tanh(cfg.AlphaAlign * ks.Zs * ks.Zf)
+	wSlowDir := corrLike * wSlowMag
+	alignment := (1.0 + wSlowDir) / 2.0 // [0,1]
+
+	g3 := alignment * ks.Zf
+	w3 := ks.WCoherence * ks.WVolMid
+
+	raw := w3 * g3
+	return clamp(raw/(cfg.S3+eps), -1.0, 1.0)
+}
+
+// K4 – Price/flow breakout continuation.
+func (ks *KernelState) computeK4() float64 {
+	cfg := ks.Cfg
+
+	impMag := math.Tanh(cfg.AlphaR * math.Abs(ks.RFastZ))
+	alignOK := ks.Zf*ks.RFastZ > 0
+
+	var g4 float64
+	if alignOK {
+		g4Mag := math.Min(math.Abs(ks.Zf), math.Abs(ks.RFastZ))
+		g4 = math.Copysign(g4Mag, ks.Zf)
+	} else {
+		g4 = 0.0
+	}
+
+	wImp := impMag * ks.WVolHi * ks.WActTail * ks.WCoherence
+	raw := wImp * (g4 / (cfg.S4 + eps))
+	return math.Tanh(cfg.B4 * raw)
+}
+
+// K5 – Overstretch mean-reversion (small, capped contrarian).
+func (ks *KernelState) computeK5() float64 {
+	cfg := ks.Cfg
+
+	zE0 := 1.0
+	excessE := math.Max(ks.ZElast-zE0, 0.0)
+	wOver := math.Tanh(cfg.AlphaElastW * excessE)
+
+	wFlat := 1.0 - math.Tanh(cfg.AlphaFlatSlow*math.Abs(ks.Zs))
+
+	g5 := -ks.Zf
+	w5 := wOver * wFlat * ks.WNoise * ks.WFlow
+
+	raw := w5 * g5
+	lin := raw / (cfg.S5 + eps)
+	return clamp(lin, -cfg.KMax, cfg.KMax)
+}
+
+// --- Coherence (reused from old f4, but as a helper) ---
+
+func computeCoherence(c *Core, f WindowSnap) float64 {
 	N := f.Count
 	if N < 3 {
 		return 0
 	}
 
-	start := f.Start
+	startIdx := int64(f.Start)
+
 	var npp, npm, nmp, nmm float64
 	var cntP, cntM float64
 
-	prevIdx := start
+	prevIdx := int(startIdx % int64(c.N))
 	prevSide := c.side[prevIdx]
 
 	for k := 1; k < N; k++ {
-		idx := (start + k) % c.N
+		idx := int((startIdx + int64(k)) % int64(c.N))
 		curSide := c.side[idx]
 
 		if prevSide > 0 {
@@ -1441,17 +2835,16 @@ func (e *Engine) f4_Coherence(f WindowSnap) float64 {
 				nmm++
 			}
 		}
-
 		prevIdx = idx
 		prevSide = curSide
 	}
 
-	Ppp := npp / (npp + npm + 1e-12)
+	Ppp := npp / (npp + npm + eps)
 	Ppm := 1.0 - Ppp
-	Pmp := nmp / (nmp + nmm + 1e-12)
+	Pmp := nmp / (nmp + nmm + eps)
 	Pmm := 1.0 - Pmp
 
-	piP := cntP / (float64(N-1) + 1e-12)
+	piP := cntP / (float64(N-1) + eps)
 	piM := 1.0 - piP
 
 	h := 0.0
@@ -1478,21 +2871,23 @@ func (e *Engine) f4_Coherence(f WindowSnap) float64 {
 	return C
 }
 
-// f5: Alignment (Fast + Slow + Coherence)
-func (e *Engine) f5_Align(f, s WindowSnap, C float64) float64 {
-	c := e.Core
+// --- Small helpers ---
 
-	scaleF := math.Sqrt(c.EWVarBf + 1e-12)
-	scaleS := math.Sqrt(c.EWVarBs + 1e-12)
-
-	Zf := f.B / (scaleF + 1e-12)
-	Zs := s.B / (scaleS + 1e-12)
-
-	align := math.Tanh(Zf) * math.Tanh(Zs)
-	return C * align
+func clamp(x, lo, hi float64) float64 {
+	if x < lo {
+		return lo
+	}
+	if x > hi {
+		return hi
+	}
+	return x
 }
 
-// --- IO Helpers ---
+func softstep(x, k float64) float64 {
+	return 0.5 + 0.5*math.Tanh(k*x)
+}
+
+// --- IO Helpers (unchanged) ---
 
 func discoverTasks(sym string) []ofiTask {
 	root := filepath.Join(BaseDir, sym)
@@ -1507,7 +2902,7 @@ func discoverTasks(sym string) []ofiTask {
 			continue
 		}
 		y, err := strconv.Atoi(yDir.Name())
-		if err != nil || y <= 0 {
+		if err != nil {
 			continue
 		}
 
@@ -1520,7 +2915,7 @@ func discoverTasks(sym string) []ofiTask {
 				continue
 			}
 			m, err := strconv.Atoi(mDir.Name())
-			if err != nil || m < 1 || m > 12 {
+			if err != nil {
 				continue
 			}
 
@@ -1530,17 +2925,12 @@ func discoverTasks(sym string) []ofiTask {
 				continue
 			}
 			var hdr [16]byte
-			if _, err := io.ReadFull(f, hdr[:]); err != nil {
-				f.Close()
-				continue
-			}
+			io.ReadFull(f, hdr[:])
 			count := binary.LittleEndian.Uint64(hdr[8:])
 			var row [26]byte
 
 			for i := uint64(0); i < count; i++ {
-				if _, err := io.ReadFull(f, row[:]); err != nil {
-					break
-				}
+				io.ReadFull(f, row[:])
 				d := int(binary.LittleEndian.Uint16(row[0:]))
 				offset := int64(binary.LittleEndian.Uint64(row[2:]))
 				length := int64(binary.LittleEndian.Uint64(row[10:]))
@@ -1587,6 +2977,7 @@ func loadRawBlob(sym string, t ofiTask) ([]byte, uint64, bool) {
 		return nil, 0, false
 	}
 
+	// Skip 48-byte AGG3 header
 	if len(raw) < HeaderSize {
 		return nil, 0, false
 	}
@@ -1608,7 +2999,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"iter"
 	"math"
 	"os"
 	"path/filepath"
@@ -1616,6 +3006,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 )
@@ -1623,22 +3014,27 @@ import (
 // --- Configuration ---
 
 const (
-	OOSDateStr   = "2024-01-01"
-	StudyMaxRows = 10_000_000
+	OOSDateStr     = "2024-01-01"
+	StudyMaxRows   = 10_000_000
+	NumBuckets     = 5
+	QuantileStride = 10 // Only use 1 in 10 rows for quantile sorting (10x speedup)
 )
 
 var TimeHorizonsSec = []int{10, 30, 60, 180, 300}
+
 var oosBoundaryYMD int
 
 func init() {
 	oosBoundaryYMD = parseOOSBoundary(OOSDateStr)
 }
 
+// DayResult carries per-day metrics and quantile results
 type DayResult struct {
 	YMD int
-	// Metrics[VariantName][HorizonIdx]
-	// If a file is 5D, we produce 5 virtual variants: "Var_f1", "Var_f2", ...
+	// Metrics[VariantKey][HorizonIdx]
 	Metrics map[string][]Moments
+	// Quantiles[VariantKey][HorizonIdx] -> []BucketResult
+	Quantiles map[string]map[int][]BucketResult
 }
 
 // --- Main Logic ---
@@ -1686,21 +3082,21 @@ func studySymbol(sym string) {
 		}
 	}
 	slices.Sort(variants)
-
 	if len(variants) == 0 {
 		return
 	}
 
 	tasks := discoverStudyDays(filepath.Join(featRoot, variants[0]))
-	fmt.Printf("Variants: %d | Days: %d\n", len(variants), len(tasks))
+	totalTasks := len(tasks)
+	fmt.Printf("Variants: %d | Days: %d\n", len(variants), totalTasks)
 
-	// Accumulators: Map[FeatureKey] -> [Horizon]Moments
+	// Aggregators
 	isAcc := make(map[string][]Moments)
 	oosAcc := make(map[string][]Moments)
-
-	// Daily ICs for t-stat: Map[FeatureKey][HorizonIdx] -> []IC
 	isDailyIC := make(map[string]map[int][]float64)
 	oosDailyIC := make(map[string]map[int][]float64)
+	isBuckets := make(map[string]map[int][]BucketAgg)
+	oosBuckets := make(map[string]map[int][]BucketAgg)
 
 	var accMu sync.Mutex
 
@@ -1708,22 +3104,70 @@ func studySymbol(sym string) {
 	jobsChan := make(chan int, len(tasks))
 	var wg sync.WaitGroup
 
+	// --- Progress Bar State ---
+	var completed atomic.Int64
+	doneChan := make(chan bool)
+
+	// Monitor Goroutine
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		start := time.Now()
+
+		for {
+			select {
+			case <-doneChan:
+				printProgress(totalTasks, totalTasks, start)
+				fmt.Println()
+				return
+			case <-ticker.C:
+				curr := completed.Load()
+				printProgress(int(curr), totalTasks, start)
+			}
+		}
+	}()
+
+	// Workers
 	for i := 0; i < CPUThreads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Buffers reused per thread
+
+			// Thread-local buffers - Optimized for RAM
+			// MaxRows = 10M. float64 = 8 bytes.
+			// prices: 80MB
 			prices := make([]float64, StudyMaxRows)
+			// times: 80MB
 			times := make([]int64, StudyMaxRows)
-			sigBuf := make([]float64, StudyMaxRows*5) // up to 5D
-			fileBuf := make([]byte, StudyMaxRows*5*8)
+
+			// sigBuf: 80MB (process 1 feature dim at a time)
+			sigBuf := make([]float64, StudyMaxRows)
+
+			// fileBuf: raw feature binary (float32 interleaved)
+			fileBuf := make([]byte, StudyMaxRows*FeatDims*FeatBytes)
+
+			// retBuf: 80MB (per-horizon reused)
+			retBuf := make([]float64, StudyMaxRows)
 
 			for idx := range jobsChan {
+				dayInt := tasks[idx]
+				// Quantiles only for IS (pre-OOS boundary)
+				doQuantiles := dayInt < oosBoundaryYMD
+
 				res := processStudyDay(
-					sym, tasks[idx], variants, featRoot,
-					&prices, &times, &sigBuf, &fileBuf,
+					sym,
+					dayInt,
+					variants,
+					featRoot,
+					&prices,
+					&times,
+					&sigBuf,
+					&fileBuf,
+					&retBuf,
+					doQuantiles,
 				)
 				resultsChan <- res
+				completed.Add(1)
 			}
 		}()
 	}
@@ -1736,6 +3180,7 @@ func studySymbol(sym string) {
 	go func() {
 		wg.Wait()
 		close(resultsChan)
+		close(doneChan)
 	}()
 
 	isDays, oosDays := 0, 0
@@ -1753,21 +3198,22 @@ func studySymbol(sym string) {
 
 		accMu.Lock()
 		for vName, moms := range res.Metrics {
-			// Ensure accumulators exist
 			if _, ok := isAcc[vName]; !ok {
 				isAcc[vName] = make([]Moments, len(TimeHorizonsSec))
 				oosAcc[vName] = make([]Moments, len(TimeHorizonsSec))
-			}
-			if _, ok := isDailyIC[vName]; !ok {
 				isDailyIC[vName] = make(map[int][]float64)
 				oosDailyIC[vName] = make(map[int][]float64)
+				isBuckets[vName] = make(map[int][]BucketAgg)
+				oosBuckets[vName] = make(map[int][]BucketAgg)
 			}
 
-			target := isAcc[vName]
-			icMap := isDailyIC[vName]
+			tMoments := isAcc[vName]
+			tDailyIC := isDailyIC[vName]
+			tBuckets := isBuckets[vName]
 			if isOOS {
-				target = oosAcc[vName]
-				icMap = oosDailyIC[vName]
+				tMoments = oosAcc[vName]
+				tDailyIC = oosDailyIC[vName]
+				tBuckets = oosBuckets[vName]
 			}
 
 			for hIdx := range TimeHorizonsSec {
@@ -1776,28 +3222,36 @@ func studySymbol(sym string) {
 					continue
 				}
 
-				// Aggregate Moments
-				target[hIdx].Add(m)
+				tMoments[hIdx].Add(m)
 
-				// Per-day IC for stability T-stat:
-				// IC = Corr(signal, return) using this day's Moments m
 				num := m.Count*m.SumProd - m.SumSig*m.SumRet
 				denX := m.Count*m.SumSqSig - m.SumSig*m.SumSig
 				denY := m.Count*m.SumSqRet - m.SumRet*m.SumRet
 				den := denX * denY
-
 				ic := 0.0
 				if den > 0 {
 					ic = num / math.Sqrt(den)
 				}
+				tDailyIC[hIdx] = append(tDailyIC[hIdx], ic)
 
-				icMap[hIdx] = append(icMap[hIdx], ic)
+				if qMap, ok := res.Quantiles[vName]; ok {
+					if qList, ok2 := qMap[hIdx]; ok2 {
+						if len(tBuckets[hIdx]) == 0 {
+							tBuckets[hIdx] = make([]BucketAgg, NumBuckets)
+						}
+						for i, bucket := range qList {
+							if i < NumBuckets {
+								tBuckets[hIdx][i].Add(bucket)
+							}
+						}
+					}
+				}
 			}
 		}
 		accMu.Unlock()
 	}
 
-	// Collect feature keys
+	// Output Tables
 	var finalKeys []string
 	for k := range isAcc {
 		finalKeys = append(finalKeys, k)
@@ -1808,17 +3262,53 @@ func studySymbol(sym string) {
 		printHorizonTable(
 			sec,
 			finalKeys,
-			isAcc, oosAcc,
-			isDailyIC, oosDailyIC,
+			isAcc,
+			oosAcc,
+			isDailyIC,
+			oosDailyIC,
 			hIdx,
-			isDays, oosDays,
+			isDays,
+			oosDays,
+		)
+		printMonotonicityTable(
+			sec,
+			finalKeys,
+			isBuckets,
+			hIdx,
 		)
 		fmt.Println()
 	}
 }
 
-// Per-day processing: load raw agg data, load 1D/5D features, and
-// compute Moments per feature/horizon.
+// --- Progress Helper ---
+
+func printProgress(curr, total int, start time.Time) {
+	if total == 0 {
+		return
+	}
+	const barWidth = 40
+	percent := float64(curr) / float64(total)
+	if percent > 1.0 {
+		percent = 1.0
+	}
+
+	filled := int(percent * float64(barWidth))
+	empty := barWidth - filled
+
+	bar := strings.Repeat("=", filled) + strings.Repeat("-", empty)
+	if filled > 0 && filled < barWidth {
+		bar = bar[:filled-1] + ">" + bar[filled:]
+	}
+
+	elapsed := time.Since(start).Seconds()
+	rate := 0.0
+	if elapsed > 0 {
+		rate = float64(curr) / elapsed
+	}
+
+	fmt.Printf("\r[%s] %.1f%% (%d/%d) | %.1f days/s  ", bar, percent*100, curr, total, rate)
+}
+
 func processStudyDay(
 	sym string,
 	dayInt int,
@@ -1828,9 +3318,18 @@ func processStudyDay(
 	times *[]int64,
 	sigBuf *[]float64,
 	fileBuf *[]byte,
+	retBuf *[]float64, // Pre-allocated return buffer (sized for 1 horizon)
+	doQuantiles bool, // Only IS
 ) DayResult {
-	y, m, d := dayInt/10000, (dayInt%10000)/100, dayInt%100
-	res := DayResult{YMD: dayInt, Metrics: make(map[string][]Moments)}
+	y := dayInt / 10000
+	m := (dayInt % 10000) / 100
+	d := dayInt % 100
+
+	res := DayResult{
+		YMD:       dayInt,
+		Metrics:   make(map[string][]Moments),
+		Quantiles: make(map[string]map[int][]BucketResult),
+	}
 
 	rawBytes, rowCount, ok := loadRawDay(sym, y, m, d)
 	if !ok || rowCount == 0 {
@@ -1844,34 +3343,32 @@ func processStudyDay(
 	if n > cap(*times) {
 		*times = make([]int64, n+n/4)
 	}
-
 	p := (*prices)[:n]
-	t := (*times)[:n]
+	tm := (*times)[:n]
 
 	for i := 0; i < n; i++ {
 		off := i * RowSize
 		p[i] = float64(binary.LittleEndian.Uint64(rawBytes[off+8:]))
-		t[i] = int64(binary.LittleEndian.Uint64(rawBytes[off+38:]))
+		tm[i] = int64(binary.LittleEndian.Uint64(rawBytes[off+38:]))
 	}
 
 	dStr := fmt.Sprintf("%04d%02d%02d", y, m, d)
+
+	// --- Feature Loop ---
 
 	for _, v := range variants {
 		sigPath := filepath.Join(featRoot, v, dStr+".bin")
 
 		rawSigs, byteSize, ok := fastLoadBytes(sigPath, fileBuf)
-		if !ok {
+		if !ok || byteSize == 0 {
 			continue
 		}
 
-		if n == 0 {
+		if byteSize%(n*FeatBytes) != 0 {
 			continue
 		}
-		if byteSize%(n*8) != 0 {
-			continue
-		}
-		dims := byteSize / (n * 8)
-		if dims < 1 || dims > 5 {
+		dims := byteSize / (n * FeatBytes)
+		if dims < 1 || dims > FeatDims {
 			continue
 		}
 
@@ -1884,10 +3381,11 @@ func processStudyDay(
 		for dim := 0; dim < dims; dim++ {
 			target := (*sigBuf)[:n]
 
+			// De-interleave float32 -> float64
 			for i := 0; i < n; i++ {
-				offset := (i*dims + dim) * 8
-				bits := binary.LittleEndian.Uint64(rawSigs[offset:])
-				target[i] = math.Float64frombits(bits)
+				offset := (i*dims + dim) * FeatBytes
+				bits := binary.LittleEndian.Uint32(rawSigs[offset:])
+				target[i] = float64(math.Float32frombits(bits))
 			}
 
 			key := v
@@ -1900,58 +3398,235 @@ func processStudyDay(
 			}
 
 			moms := make([]Moments, len(TimeHorizonsSec))
-			for hIdx, sec := range TimeHorizonsSec {
-				seq := AlignVectors(target, p, t, sec*1000)
-				moms[hIdx] = CalcMomentsStream(seq)
+			var qMap map[int][]BucketResult
+			if doQuantiles {
+				qMap = make(map[int][]BucketResult)
 			}
+
+			// JIT Return Calculation Loop (per horizon)
+			for hIdx, sec := range TimeHorizonsSec {
+				// 1. Calculate returns for this horizon ONLY
+				computeReturns(p, tm, n, sec, retBuf)
+				rets := (*retBuf)[:n]
+
+				// 2. Calc Stats (Moments + BPS/TR)
+				moms[hIdx] = CalcMomentsDirect(target, rets)
+
+				if doQuantiles {
+					qMap[hIdx] = ComputeQuantilesStrided(target, rets, NumBuckets, QuantileStride)
+				}
+			}
+
 			res.Metrics[key] = moms
+			if doQuantiles && len(qMap) > 0 {
+				res.Quantiles[key] = qMap
+			}
 		}
 	}
+
 	return res
 }
 
-// AlignVectors: aligns signal with future returns at horizon hMs.
-func AlignVectors(sig, prices []float64, times []int64, hMs int) iter.Seq2[float64, float64] {
-	return func(yield func(float64, float64) bool) {
-		n := len(sig)
-		j := 0
-		hVal := int64(hMs)
+// computeReturns calculates future returns for a specific horizon into outBuf
+func computeReturns(p []float64, tm []int64, n int, sec int, outBuf *[]float64) {
+	if n > cap(*outBuf) {
+		*outBuf = make([]float64, n+n/4)
+	}
+	outSlice := (*outBuf)[:n]
 
-		for i := 0; i < n; i++ {
-			s := sig[i]
-			if s == 0 {
-				continue
-			}
+	hVal := int64(sec * 1000)
+	right := 0
 
-			pStart := prices[i]
-			if pStart <= 0 {
-				continue
-			}
+	for left := 0; left < n; left++ {
+		targetTime := tm[left] + hVal
 
-			tTarget := times[i] + hVal
-			if j < i+1 {
-				j = i + 1
-			}
+		if right < left {
+			right = left
+		}
+		for right < n && tm[right] < targetTime {
+			right++
+		}
 
-			for j < n && times[j] < tTarget {
-				j++
+		if right >= n {
+			// End of data: fill remainder with 0
+			for k := left; k < n; k++ {
+				outSlice[k] = 0
 			}
-			if j >= n {
-				break
-			}
+			return
+		}
 
-			pEnd := prices[j]
-			if pEnd > 0 {
-				r := (pEnd - pStart) / pStart
-				if !yield(s, r) {
-					return
-				}
-			}
+		pStart := p[left]
+		pEnd := p[right]
+		if pStart > 0 {
+			outSlice[left] = (pEnd - pStart) / pStart
+		} else {
+			outSlice[left] = 0
 		}
 	}
 }
 
-// Loads full file into buffer, returns slice and total size in bytes.
+// CalcMomentsDirect computes moments without re-aligning
+func CalcMomentsDirect(sigs, rets []float64) Moments {
+	var m Moments
+	n := len(sigs)
+
+	var prevSig float64
+	var prevSign float64
+	var curSegLen float64
+
+	for i := 0; i < n; i++ {
+		s := sigs[i]
+		r := rets[i]
+
+		m.Count++
+		m.SumSig += s
+		m.SumRet += r
+		m.SumSqSig += s * s
+		m.SumSqRet += r * r
+		m.SumProd += s * r
+
+		pnl := s * r
+		m.SumPnL += pnl
+		m.SumSqPnL += pnl * pnl
+
+		absS := s
+		if absS < 0 {
+			absS = -absS
+		}
+		m.SumAbsSig += absS
+
+		if s != 0 && r != 0 {
+			m.ValidHits++
+			if (s > 0 && r > 0) || (s < 0 && r < 0) {
+				m.Hits++
+			}
+		}
+
+		// Dynamics
+		if i > 0 {
+			d := s - prevSig
+			if d < 0 {
+				d = -d
+			}
+			m.SumAbsDeltaSig += d
+			m.SumProdLag += s * prevSig
+
+			absPrev := prevSig
+			if absPrev < 0 {
+				absPrev = -absPrev
+			}
+			m.SumAbsProdLag += absS * absPrev
+		}
+
+		// Segment logic
+		sign := 0.0
+		if s > 0 {
+			sign = 1.0
+		} else if s < 0 {
+			sign = -1.0
+		}
+
+		if sign != 0 {
+			if prevSign == sign {
+				curSegLen++
+			} else {
+				if curSegLen > 0 {
+					m.SegCount++
+					m.SegLenTotal += curSegLen
+					if curSegLen > m.SegLenMax {
+						m.SegLenMax = curSegLen
+					}
+				}
+				curSegLen = 1
+			}
+		} else {
+			if curSegLen > 0 {
+				m.SegCount++
+				m.SegLenTotal += curSegLen
+				if curSegLen > m.SegLenMax {
+					m.SegLenMax = curSegLen
+				}
+				curSegLen = 0
+			}
+		}
+
+		prevSig = s
+		prevSign = sign
+	}
+
+	if curSegLen > 0 {
+		m.SegCount++
+		m.SegLenTotal += curSegLen
+		if curSegLen > m.SegLenMax {
+			m.SegLenMax = curSegLen
+		}
+	}
+
+	return m
+}
+
+// ComputeQuantilesStrided sorts a SUBSET of data (stride) to find buckets fast.
+func ComputeQuantilesStrided(sigs, rets []float64, numBuckets, stride int) []BucketResult {
+	n := len(sigs)
+	if n == 0 || numBuckets <= 0 {
+		return nil
+	}
+
+	estSize := n / stride
+	type pair struct{ s, r float64 }
+	pairs := make([]pair, 0, estSize)
+
+	for i := 0; i < n; i += stride {
+		pairs = append(pairs, pair{s: sigs[i], r: rets[i]})
+	}
+
+	if len(pairs) == 0 {
+		return nil
+	}
+
+	slices.SortFunc(pairs, func(a, b pair) int {
+		if a.s < b.s {
+			return -1
+		}
+		if a.s > b.s {
+			return 1
+		}
+		return 0
+	})
+
+	subN := len(pairs)
+	results := make([]BucketResult, numBuckets)
+	bucketSize := subN / numBuckets
+	if bucketSize == 0 {
+		bucketSize = 1
+	}
+
+	for b := 0; b < numBuckets; b++ {
+		start := b * bucketSize
+		end := start + bucketSize
+		if b == numBuckets-1 || end > subN {
+			end = subN
+		}
+
+		var sumS, sumR float64
+		count := 0
+		for i := start; i < end; i++ {
+			sumS += pairs[i].s
+			sumR += pairs[i].r
+			count++
+		}
+		if count > 0 {
+			results[b] = BucketResult{
+				ID:        b + 1,
+				AvgSig:    sumS / float64(count),
+				AvgRetBps: (sumR / float64(count)) * 10000.0,
+				Count:     count * stride,
+			}
+		}
+	}
+	return results
+}
+
 func fastLoadBytes(path string, fileBuf *[]byte) ([]byte, int, bool) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1976,12 +3651,25 @@ func fastLoadBytes(path string, fileBuf *[]byte) ([]byte, int, bool) {
 	if _, err := io.ReadFull(f, buf); err != nil {
 		return nil, 0, false
 	}
-
 	return buf, size, true
 }
 
-// --- Output / helpers ---
+// --- Output ---
 
+// printHorizonTable now reports BOTH IS and OOS BPS/TR.
+//
+// Interpretation of BPS/TR:
+//
+//   - This is BreakevenBps from MetricStats.
+//
+//   - It is GROSS alpha at mid per 1 unit of notional traded (per side).
+//
+//   - For a pure taker strategy with fee F bps PER SIDE,
+//     NetBpsPerSide = OOS_BPS_TR - F
+//
+//   - So:
+//     OOS_BPS_TR > 4  → can in principle beat 4 bps per-side taker fee.
+//     OOS_BPS_TR > 2  → can beat 2 bps effective per-side maker/taker blend.
 func printHorizonTable(
 	sec int,
 	keys []string,
@@ -1991,10 +3679,9 @@ func printHorizonTable(
 ) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "== Horizon %ds [IS: %d | OOS: %d] ==\n", sec, isDays, oosDays)
-	fmt.Fprintln(w, "FEATURE\tIS_IC\tIS_T\tOOS_IC\tOOS_T\tAC(Lag1)\tBPS/TR")
+	fmt.Fprintln(w, "FEATURE\tIS_IC\tIS_T\tOOS_IC\tOOS_T\tAC1\t|AC1|\tAVG_SEG\tMAX_SEG\tIS_BPS/TR\tOOS_BPS/TR")
 
 	for _, k := range keys {
-		// Guard against missing IC slices
 		var isICSlice, oosICSlice []float64
 		if m, ok := isDailyIC[k]; ok {
 			isICSlice = m[hIdx]
@@ -2003,18 +3690,80 @@ func printHorizonTable(
 			oosICSlice = m[hIdx]
 		}
 
-		is := FinalizeMetrics(isAcc[k][hIdx], isICSlice)
-		oos := FinalizeMetrics(oosAcc[k][hIdx], oosICSlice)
+		isStats := FinalizeMetrics(isAcc[k][hIdx], isICSlice)
+		oosStats := FinalizeMetrics(oosAcc[k][hIdx], oosICSlice)
 
-		fmt.Fprintf(w, "%s\t%.4f\t%.2f\t%.4f\t%.2f\t%.3f\t%.2f\n",
+		fmt.Fprintf(w, "%s\t%.4f\t%.2f\t%.4f\t%.2f\t%.3f\t%.3f\t%.2f\t%.1f\t%.2f\t%.2f\n",
 			k,
-			is.ICPearson, is.IC_TStat,
-			oos.ICPearson, oos.IC_TStat,
-			is.AutoCorr,
-			is.BreakevenBps,
+			isStats.ICPearson, isStats.IC_TStat,
+			oosStats.ICPearson, oosStats.IC_TStat,
+			isStats.AutoCorr,
+			isStats.AutoCorrAbs,
+			isStats.AvgSegLen,
+			isStats.MaxSegLen,
+			isStats.BreakevenBps,  // IS gross bps per side-turnover
+			oosStats.BreakevenBps, // OOS gross bps per side-turnover (use this vs fees)
 		)
 	}
 	w.Flush()
+}
+
+func printMonotonicityTable(
+	sec int,
+	keys []string,
+	isBuckets map[string]map[int][]BucketAgg,
+	hIdx int,
+) {
+	fmt.Printf("\n-- Monotonicity Check (IS) Horizon %ds --\n", sec)
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
+	fmt.Fprintln(w, "FEATURE\tMONO\tB1(Sell)\tB2\tB3\tB4\tB5(Buy)")
+
+	for _, k := range keys {
+		aggs, ok := isBuckets[k][hIdx]
+		if !ok || len(aggs) < NumBuckets {
+			continue
+		}
+
+		brets := make([]float64, NumBuckets)
+		for i := 0; i < NumBuckets; i++ {
+			br := aggs[i].Finalize(i + 1)
+			brets[i] = br.AvgRetBps
+		}
+
+		mono := bucketMonotonicity(brets)
+
+		fmt.Fprintf(w, "%s\t%.3f", k, mono)
+		for i := 0; i < NumBuckets; i++ {
+			fmt.Fprintf(w, "\t%.1f", brets[i])
+		}
+		fmt.Fprintln(w, "")
+	}
+	w.Flush()
+}
+
+func bucketMonotonicity(rets []float64) float64 {
+	n := len(rets)
+	if n == 0 {
+		return 0
+	}
+	var sumX, sumY, sumXY, sumX2, sumY2 float64
+	nf := float64(n)
+	for i := 0; i < n; i++ {
+		x := float64(i + 1)
+		y := rets[i]
+		sumX += x
+		sumY += y
+		sumXY += x * y
+		sumX2 += x * x
+		sumY2 += y * y
+	}
+	num := nf*sumXY - sumX*sumY
+	denX := nf*sumX2 - sumX*sumX
+	denY := nf*sumY2 - sumY*sumY
+	if denX <= 0 || denY <= 0 {
+		return 0
+	}
+	return num / math.Sqrt(denX*denY)
 }
 
 func discoverStudyDays(vDir string) []int {
@@ -2078,11 +3827,11 @@ func loadRawDay(sym string, y, m, d int) ([]byte, uint64, bool) {
 	if err != nil {
 		return nil, 0, false
 	}
-	if len(raw) < HeaderSize {
+	if len(raw) < 48 {
 		return nil, 0, false
 	}
 	rowCount := binary.LittleEndian.Uint64(raw[8:])
-	return raw[HeaderSize:], rowCount, true
+	return raw[48:], rowCount, true
 }
 
 func findBlobOffset(idxPath string, day int) (uint64, uint64) {
@@ -2091,6 +3840,7 @@ func findBlobOffset(idxPath string, day int) (uint64, uint64) {
 		return 0, 0
 	}
 	defer f.Close()
+
 	var hdr [16]byte
 	if _, err := io.ReadFull(f, hdr[:]); err != nil {
 		return 0, 0
