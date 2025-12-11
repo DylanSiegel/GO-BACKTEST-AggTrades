@@ -92,15 +92,18 @@ func CalcMomentsStream(seq iter.Seq2[float64, float64]) Moments {
 	return m
 }
 
-// Slice-based variant used when we have already materialized (sig, ret) pairs
-// for quantile analysis. Keeps math identical to CalcMomentsStream.
+// Slice-based variant. Optimized for bounds-check elimination on loops.
 func CalcMomentsVectors(sigs, rets []float64) Moments {
 	var m Moments
 	n := len(sigs)
-	if n == 0 {
+	if n == 0 || len(rets) < n {
 		return m
 	}
 	prevSig := 0.0
+
+	// Hint to compiler for BCE (Bounds Check Elimination)
+	_ = rets[n-1]
+	_ = sigs[n-1]
 
 	for i := 0; i < n; i++ {
 		s := sigs[i]

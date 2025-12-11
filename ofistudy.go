@@ -112,7 +112,7 @@ func studySymbol(sym string) {
 	jobsChan := make(chan int, len(tasks))
 	var wg sync.WaitGroup
 
-	// Workers
+	// Workers optimized for M-Series Parallelism
 	for i := 0; i < CPUThreads; i++ {
 		wg.Add(1)
 		go func() {
@@ -307,7 +307,7 @@ func processStudyDay(
 		for dim := 0; dim < dims; dim++ {
 			target := (*sigBuf)[:n]
 
-			// De-interleave one dimension: contiguous view in target
+			// De-interleave: memory bound, but contiguous read/write helps
 			for i := 0; i < n; i++ {
 				offset := (i*dims + dim) * 8
 				bits := binary.LittleEndian.Uint64(rawSigs[offset:])

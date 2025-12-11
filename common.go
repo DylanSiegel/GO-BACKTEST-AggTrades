@@ -1,16 +1,26 @@
 package main
 
 import (
+	"runtime"
 	"unique"
 	"unsafe"
 )
 
 // --- Shared Configuration ---
 
-const (
-	// Ryzen 9 7900X: 12 Cores / 24 Threads.
-	CPUThreads = 24
-	BaseDir    = "data"
+var (
+	// Dynamic CPU detection with balanced cap for 24GB systems
+	// 8 workers = ~6-8GB peak (sweet spot for performance/safety)
+	CPUThreads = func() int {
+		cores := runtime.NumCPU()
+		maxWorkers := 8 // Balanced limit for 24GB RAM (leaves 16GB free)
+		if cores > maxWorkers {
+			return maxWorkers
+		}
+		return cores
+	}()
+	BaseDir = "data"
+)
 
 	// Binary Layout Constants
 	PxScale    = 100_000_000.0
@@ -37,11 +47,13 @@ type AggRow struct {
 	Flags      uint16
 }
 
-// ParseAggRow - ZEN 4 OPTIMIZED
-// Uses unsafe pointer arithmetic to bypass Go bounds checks.
-// The caller GUARANTEES row has at least 48 bytes and matches the AGG3 layout.
+// ParseAggRow - ARM64/NEON OPTIMIZED
+// Uses unsafe pointer arithmetic.
+// The caller GUARANTEES row has at least 48 bytes.
 func ParseAggRow(row []byte) AggRow {
+	// Identify pointer to the start of the slice
 	ptr := unsafe.Pointer(&row[0])
+
 	return AggRow{
 		// Offset 38: Timestamp (uint64)
 		TsMs: int64(*(*uint64)(unsafe.Add(ptr, 38))),

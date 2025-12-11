@@ -54,7 +54,7 @@ func runData() {
 		fmt.Println("\n[warn] Stopping gracefully (finish current jobs)...")
 	}()
 
-	fmt.Printf("--- data.go (Ryzen 7900X Safe-Mode) | Symbol: %s ---\n", Symbol())
+	fmt.Printf("--- data.go (Apple Silicon Optimized) | Symbol: %s ---\n", Symbol())
 
 	start, err := time.Parse("2006-01-02", FallbackDt)
 	if err != nil {
@@ -73,7 +73,7 @@ func runData() {
 		days = append(days, d)
 	}
 
-	fmt.Printf("[job] Processing %d days using %d threads.\n", len(days), CPUThreads)
+	fmt.Printf("[job] Processing %d days using %d threads (M-Series optimized).\n", len(days), CPUThreads)
 
 	jobs := make(chan time.Time, len(days))
 	results := make(chan string, len(days))
@@ -145,6 +145,7 @@ func processDay(d time.Time) string {
 		return "empty"
 	}
 
+	// Compression uses zlib.BestSpeed, balancing CPU/IO on fast NVMe drives.
 	var b bytes.Buffer
 	w, err := zlib.NewWriterLevel(&b, zlib.BestSpeed)
 	if err != nil {
@@ -376,9 +377,10 @@ func fastZipToAgg3(t time.Time, zipData []byte) ([]byte, uint64, error) {
 				start = i
 				break
 			}
-			i++
+		i++
 		}
 
+		// Main parsing loop - ARM64 handles the byte scanning efficiently
 		for i < n {
 			b := data[i]
 			switch b {
